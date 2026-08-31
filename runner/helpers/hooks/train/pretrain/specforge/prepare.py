@@ -23,6 +23,7 @@ import argparse
 import os
 from pathlib import Path
 
+from primus.backends.specforge.argument_builder import flatten_overrides
 from primus.core.launcher.parser import load_primus_config
 from runner.helpers.hooks.train.pretrain.utils import log_error_and_exit, log_info
 
@@ -71,14 +72,11 @@ def preflight_hidden_states(pre_trainer_cfg):
     let SpecForge validate its own config.
     """
 
-    overrides = getattr(pre_trainer_cfg, "specforge_overrides", None)
-    hidden_states = None
-    if overrides is not None:
-        hidden_states = getattr(overrides, "hidden_states_path", None)
-        data = getattr(overrides, "data", None)
-        if hidden_states is None and data is not None:
-            hidden_states = getattr(data, "hidden_states_path", None)
-    if hidden_states is None:
+    # Overrides may be written either nested (`data: {hidden_states_path: ...}`)
+    # or with dotted Hydra keys; flatten_overrides normalizes both.
+    overrides = flatten_overrides(getattr(pre_trainer_cfg, "specforge_overrides", None))
+    hidden_states = overrides.get("data.hidden_states_path") or overrides.get("hidden_states_path")
+    if not hidden_states:
         hidden_states = os.getenv("HIDDEN_STATES_PATH")
 
     if not hidden_states:
