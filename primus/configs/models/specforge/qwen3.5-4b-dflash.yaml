@@ -1,0 +1,11 @@
+###############################################################################
+# Qwen3.5-4B DFlash draft model (SpecForge)
+#
+# Descriptive metadata only. The authoritative architecture and training
+# hyperparameters live in SpecForge's own config, referenced from the
+# experiment via `specforge_config`.
+###############################################################################
+model: qwen3.5-4b-dflash
+
+target_model: Qwen/Qwen3.5-4B
+draft_algorithm: dflash
