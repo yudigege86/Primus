@@ -90,9 +90,19 @@ class TestRegistration:
         assert BackendRegistry._adapters["specforge"] is SpecForgeAdapter
 
     def test_get_adapter_lazy_loads_backend(self):
+        """A cleared registry re-populates, because registration is an import side effect.
+
+        The reload stands in for the lazy import in ``_load_backend``, which is a
+        no-op here: this module is already in ``sys.modules``.
+        """
+        import importlib
+
+        import primus.backends.specforge as backend_module
+
         original = BackendRegistry._adapters.copy()
         try:
             BackendRegistry._adapters.pop("specforge", None)
+            importlib.reload(backend_module)
             adapter = BackendRegistry.get_adapter("specforge")
         finally:
             BackendRegistry._adapters = original
