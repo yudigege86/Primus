@@ -25,6 +25,30 @@ from primus.backends.specforge.argument_builder import build_specforge_argv
 from primus.core.trainer.base_trainer import BaseTrainer
 from primus.modules.module_utils import log_rank_0, warning_rank_0
 
+# SpecForge treats these as one unit: it accepts all of them or none of them.
+TORCHRUN_RANK_VARS = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+TORCHRUN_RENDEZVOUS_VARS = ("MASTER_ADDR", "MASTER_PORT")
+
+
+def clear_partial_distributed_env(env=None) -> list:
+    """Hand SpecForge either a complete torchrun environment or none at all.
+
+    ``runner/helpers/envs/primus-env.sh`` exports MASTER_ADDR/MASTER_PORT even
+    under RUN_MODE=single, where no ranks exist. SpecForge refuses to start on
+    that partial set::
+
+        distributed environment is incomplete;
+        present=['MASTER_ADDR', 'MASTER_PORT'],
+        missing=['RANK', 'WORLD_SIZE', 'LOCAL_RANK']
+
+    Returns the variables that were removed.
+    """
+
+    environ = os.environ if env is None else env
+    if all(environ.get(var) for var in TORCHRUN_RANK_VARS):
+        return []
+    return [var for var in TORCHRUN_RENDEZVOUS_VARS if environ.pop(var, None) is not None]
+
 
 class SpecForgePretrainTrainer(BaseTrainer):
     """Trainer that hands off to the SpecForge CLI."""
@@ -65,6 +89,10 @@ class SpecForgePretrainTrainer(BaseTrainer):
 
         if self.argv is None:
             raise RuntimeError("SpecForgePretrainTrainer.init() must be called before train().")
+
+        cleared = clear_partial_distributed_env()
+        if cleared:
+            log_rank_0(f"Cleared partial distributed env so SpecForge owns the launch: {cleared}")
 
         if self.workdir:
             os.chdir(self.workdir)

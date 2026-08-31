@@ -30,6 +30,7 @@ from primus.backends.specforge.argument_builder import (
 from primus.backends.specforge.specforge_adapter import SpecForgeAdapter
 from primus.backends.specforge.specforge_pretrain_trainer import (
     SpecForgePretrainTrainer,
+    clear_partial_distributed_env,
 )
 from primus.core.backend.backend_registry import BackendRegistry
 from primus.core.launcher.parser import PrimusParser
@@ -226,6 +227,30 @@ class TestExampleExperiment:
         trainer = SpecForgePretrainTrainer(backend_args=backend_args)
         with pytest.raises(RuntimeError, match="not found on PATH"):
             trainer.init()
+
+
+class TestDistributedEnvHandoff:
+    """primus-cli exports MASTER_ADDR/MASTER_PORT even in single mode."""
+
+    def test_partial_env_is_cleared(self):
+        env = {"MASTER_ADDR": "localhost", "MASTER_PORT": "1234"}
+        assert clear_partial_distributed_env(env) == ["MASTER_ADDR", "MASTER_PORT"]
+        assert env == {}
+
+    def test_complete_torchrun_env_is_preserved(self):
+        env = {
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "1234",
+            "RANK": "0",
+            "WORLD_SIZE": "8",
+            "LOCAL_RANK": "0",
+        }
+        assert clear_partial_distributed_env(env) == []
+        assert env["MASTER_ADDR"] == "localhost"
+
+    def test_empty_env_is_a_noop(self):
+        env = {}
+        assert clear_partial_distributed_env(env) == []
 
 
 class TestPrepareHook:
