@@ -19,7 +19,6 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -112,14 +111,12 @@ class TestRegistration:
         monkeypatch.delenv("SPECFORGE_ROOT", raising=False)
         monkeypatch.delenv("BACKEND_PATH", raising=False)
         adapter = SpecForgeAdapter()
-        with patch("primus.backends.specforge.specforge_adapter.log_rank_0"):
-            assert adapter.setup_backend_path() == ""
+        assert adapter.setup_backend_path() == ""
 
     def test_setup_backend_path_uses_specforge_root(self, monkeypatch, specforge_checkout):
         monkeypatch.setenv("SPECFORGE_ROOT", str(specforge_checkout))
         adapter = SpecForgeAdapter()
-        with patch("primus.backends.specforge.specforge_adapter.log_rank_0"):
-            resolved = adapter.setup_backend_path()
+        resolved = adapter.setup_backend_path()
         assert Path(resolved) == specforge_checkout.resolve()
 
 
@@ -198,8 +195,7 @@ class TestExampleExperiment:
         assert module.framework == "specforge"
 
         adapter = SpecForgeAdapter()
-        with patch("primus.backends.specforge.specforge_adapter.log_rank_0"):
-            backend_args = adapter.convert_config(module.params)
+        backend_args = adapter.convert_config(module.params)
 
         argv = build_specforge_argv(backend_args)
         assert argv[:3] == ["specforge", "train", "--config"]
