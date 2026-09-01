@@ -32,6 +32,11 @@ from primus.backends.specforge.specforge_pretrain_trainer import (
     SpecForgePretrainTrainer,
     clear_partial_distributed_env,
 )
+from primus.backends.specforge.stack_preflight import (
+    apply_rocm_stack_env,
+    collect_issues,
+    enforce_rocm_stack,
+)
 from primus.core.backend.backend_registry import BackendRegistry
 from primus.core.launcher.parser import PrimusParser
 
@@ -46,6 +51,7 @@ def specforge_checkout(tmp_path):
     root = tmp_path / "SpecForge"
     (root / "configs").mkdir(parents=True)
     (root / "pyproject.toml").write_text("[project]\nname = 'specforge'\n")
+    (root / "configs" / "qwen3.5-4b-dflash.yaml").write_text("model: dummy\n")
     return root
 
 
@@ -161,6 +167,14 @@ class TestArgvBuilder:
         assert argv[:4] == ["specforge", "train", "--config", "/sf/configs/a.yaml"]
         assert "training.max_steps=20" in argv
         assert "output_dir=/out" in argv
+
+    def test_resume_from_becomes_hydra_override(self):
+        params = SimpleNamespace(
+            specforge_config="/sf/a.yaml",
+            specforge_overrides={"training.resume_from": "/ckpt/step10"},
+        )
+        argv = build_specforge_argv(params)
+        assert "training.resume_from=/ckpt/step10" in argv
 
     def test_explicit_output_dir_override_wins(self):
         params = SimpleNamespace(
@@ -284,6 +298,11 @@ class TestPrepareHook:
         assert "env.RUN_MODE=single" in result.stdout
         assert "env.GPUS_PER_NODE=1" in result.stdout
         assert f"env.SPECFORGE_ROOT={experiment_env['SPECFORGE_ROOT']}" in result.stdout
+        combined = (result.stdout + result.stderr).lower()
+        assert "stack preflight ok" in combined
+        if enforce_rocm_stack({**experiment_env, **dict(os.environ)}):
+            assert "env.SGLANG_USE_AITER=1" in result.stdout
+            assert "env.SGLANG_DISABLE_RADIX_CACHE=1" in result.stdout
 
     def test_fails_fast_on_empty_hidden_states(self, experiment_env, tmp_path):
         empty = tmp_path / "empty_hidden_states"
@@ -296,6 +315,68 @@ class TestPrepareHook:
         result = self.run_hook({**experiment_env, "HIDDEN_STATES_PATH": str(tmp_path / "nope")})
         assert result.returncode != 0
         assert "not a directory" in result.stderr.lower()
+
+
+class TestStackPreflight:
+    def _params(self, specforge_checkout, hidden_states, **overrides):
+        return SimpleNamespace(
+            specforge_config=str(specforge_checkout / "configs" / "qwen3.5-4b-dflash.yaml"),
+            specforge_root=str(specforge_checkout),
+            specforge_overrides={"data.hidden_states_path": str(hidden_states), **overrides},
+        )
+
+    def test_apply_fills_aiter_and_radix_defaults(self):
+        env = {}
+        applied = apply_rocm_stack_env(env)
+        assert dict(applied)["SGLANG_USE_AITER"] == "1"
+        assert env["SGLANG_DISABLE_RADIX_CACHE"] == "1"
+
+    def test_apply_does_not_override_explicit_zero(self):
+        env = {"SGLANG_USE_AITER": "0"}
+        apply_rocm_stack_env(env)
+        assert env["SGLANG_USE_AITER"] == "0"
+        assert env["SGLANG_DISABLE_RADIX_CACHE"] == "1"
+
+    def test_empty_hidden_states_is_an_issue(self, specforge_checkout, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        params = self._params(specforge_checkout, empty)
+        issues = collect_issues(params, env={"PRIMUS_SPECFORGE_ENFORCE_ROCM": "0"})
+        assert any("empty" in item.lower() for item in issues)
+
+    def test_aiter_opt_out_fails_when_enforced(self, specforge_checkout, hidden_states):
+        params = self._params(specforge_checkout, hidden_states)
+        issues = collect_issues(
+            params,
+            env={
+                "PRIMUS_SPECFORGE_ENFORCE_ROCM": "1",
+                "SGLANG_USE_AITER": "0",
+                "SGLANG_DISABLE_RADIX_CACHE": "1",
+            },
+        )
+        assert any("SGLANG_USE_AITER=0" in item for item in issues)
+
+    def test_radix_opt_out_fails_when_enforced(self, specforge_checkout, hidden_states):
+        params = self._params(specforge_checkout, hidden_states)
+        issues = collect_issues(
+            params,
+            env={
+                "PRIMUS_SPECFORGE_ENFORCE_ROCM": "1",
+                "SGLANG_USE_AITER": "1",
+                "SGLANG_DISABLE_RADIX_CACHE": "0",
+            },
+        )
+        assert any("SGLANG_DISABLE_RADIX_CACHE=0" in item for item in issues)
+
+    def test_missing_specforge_config_file(self, specforge_checkout, hidden_states):
+        params = self._params(specforge_checkout, hidden_states)
+        params.specforge_config = str(specforge_checkout / "configs" / "nope.yaml")
+        issues = collect_issues(params, env={"PRIMUS_SPECFORGE_ENFORCE_ROCM": "0"})
+        assert any("specforge_config is not a file" in item for item in issues)
+
+    def test_hip_visible_devices_opts_into_enforce(self):
+        assert enforce_rocm_stack({"HIP_VISIBLE_DEVICES": "0"}, kind="missing") is True
+        assert enforce_rocm_stack({}, kind="missing") is False
 
 
 class TestPrimusParserAcceptsSpecForge:

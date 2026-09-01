@@ -22,6 +22,7 @@ import shutil
 from typing import Any, Optional
 
 from primus.backends.specforge.argument_builder import build_specforge_argv
+from primus.backends.specforge.stack_preflight import raise_if_issues
 from primus.core.trainer.base_trainer import BaseTrainer
 from primus.modules.module_utils import log_rank_0, warning_rank_0
 
@@ -65,6 +66,7 @@ class SpecForgePretrainTrainer(BaseTrainer):
     def init(self):
         """Build the SpecForge argv and validate the entrypoint is reachable."""
 
+        raise_if_issues(self.backend_args)
         self.argv = build_specforge_argv(self.backend_args)
         self.workdir = getattr(self.backend_args, "specforge_root", None)
 

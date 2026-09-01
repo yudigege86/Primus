@@ -15,15 +15,20 @@ own distributed workers. Nesting the two launchers oversubscribes every GPU, so
 this hook emits ``env.RUN_MODE=single`` (and ``env.GPUS_PER_NODE=1``) to make
 Primus launch a single plain-Python process that then execs SpecForge.
 
-It also runs a light, GPU-free preflight on the offline hidden-states directory
-so a bad path fails in seconds instead of after the container spins up.
+It also runs a GPU-free stack preflight (hidden states, SpecForge cwd, AITER /
+radix-cache, ROCm pins) so a bad image or env fails in seconds instead of after
+SpecForge starts.
 """
 
 import argparse
 import os
 from pathlib import Path
 
-from primus.backends.specforge.argument_builder import flatten_overrides
+from primus.backends.specforge.stack_preflight import (
+    apply_rocm_stack_env,
+    collect_issues,
+    enforce_rocm_stack,
+)
 from primus.core.launcher.parser import load_primus_config
 from runner.helpers.hooks.train.pretrain.utils import log_error_and_exit, log_info
 
@@ -64,31 +69,13 @@ def resolve_specforge_root(cli_path, pre_trainer_cfg):
     return None
 
 
-def preflight_hidden_states(pre_trainer_cfg):
-    """Fail fast when the offline hidden-states cache is missing or empty.
+def preflight_stack(pre_trainer_cfg):
+    """Fail fast on missing hidden states, a CUDA clobber, or AITER/radix misconfig."""
 
-    Offline DFlash training reads pre-captured hidden states from disk. This is
-    advisory: when no path is configured we assume an online/other recipe and
-    let SpecForge validate its own config.
-    """
-
-    # Overrides may be written either nested (`data: {hidden_states_path: ...}`)
-    # or with dotted Hydra keys; flatten_overrides normalizes both.
-    overrides = flatten_overrides(getattr(pre_trainer_cfg, "specforge_overrides", None))
-    hidden_states = overrides.get("data.hidden_states_path") or overrides.get("hidden_states_path")
-    if not hidden_states:
-        hidden_states = os.getenv("HIDDEN_STATES_PATH")
-
-    if not hidden_states:
-        log_info("No hidden-states path configured; skipping offline preflight.")
-        return
-
-    path = Path(str(hidden_states))
-    if not path.is_dir():
-        log_error_and_exit(f"Hidden-states path is not a directory: {path}")
-    if not any(path.iterdir()):
-        log_error_and_exit(f"Hidden-states path is empty: {path}")
-    log_info(f"Hidden-states preflight OK: {path}")
+    issues = collect_issues(pre_trainer_cfg)
+    if issues:
+        log_error_and_exit("stack preflight failed:\n" + "\n".join(f"  - {item}" for item in issues))
+    log_info("SpecForge stack preflight OK")
 
 
 def main():
@@ -112,18 +99,31 @@ def main():
     if not getattr(pre_trainer_cfg, "specforge_config", None):
         log_error_and_exit("Missing required field: pre_trainer.specforge_config")
 
-    preflight_hidden_states(pre_trainer_cfg)
-
     specforge_root = resolve_specforge_root(args.backend_path, pre_trainer_cfg)
     if specforge_root is not None:
+        os.environ["SPECFORGE_ROOT"] = str(specforge_root)
         print(f"env.SPECFORGE_ROOT={specforge_root}")
         print(f"extra.backend_path={specforge_root}")
+
+    preflight_stack(pre_trainer_cfg)
 
     # SpecForge self-launches its workers; keep Primus to one plain-Python
     # process so the two launchers do not nest.
     log_info("Exposing run mode via env.RUN_MODE=single (SpecForge owns its launcher)")
     print("env.RUN_MODE=single")
     print("env.GPUS_PER_NODE=1")
+
+    if enforce_rocm_stack(os.environ):
+        for key, value in apply_rocm_stack_env():
+            log_info(f"ROCm stack default {key}={value}")
+        # Re-print even when already set, so execute_hooks.sh exports them.
+        for key, default in (
+            ("SGLANG_USE_AITER", "1"),
+            ("SGLANG_USE_AITER_UNIFIED_ATTN", "1"),
+            ("AITER_FLYDSL_FORCE", "1"),
+            ("SGLANG_DISABLE_RADIX_CACHE", "1"),
+        ):
+            print(f"env.{key}={os.environ.get(key, default)}")
 
 
 if __name__ == "__main__":
