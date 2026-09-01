@@ -32,3 +32,5 @@ modules:
         # Liger kernels are not built in the ROCm overlay image.
         model.use_liger_kernel: false
         data.hidden_states_path: ${HIDDEN_STATES_PATH}
+        # AMD recipe defaults to 1. Set NPROC_PER_NODE to self-launch more ranks.
+        deployment.trainer.nproc_per_node: ${NPROC_PER_NODE:1}
