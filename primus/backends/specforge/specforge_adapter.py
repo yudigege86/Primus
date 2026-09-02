@@ -25,6 +25,7 @@ from primus.backends.specforge.argument_builder import (
     DEFAULT_ENTRYPOINT,
     flatten_overrides,
     resolve_specforge_root,
+    specforge_mode,
 )
 from primus.core.backend.backend_adapter import BackendAdapter
 from primus.modules.module_utils import log_rank_0, warning_rank_0
@@ -61,8 +62,9 @@ class SpecForgeAdapter(BackendAdapter):
     def convert_config(self, params: Any) -> Any:
         """Normalize Primus params into the fields the SpecForge CLI needs."""
 
+        specforge_mode_value = specforge_mode(params)
         specforge_config = getattr(params, "specforge_config", None)
-        if not specforge_config:
+        if specforge_mode_value != "capture" and not specforge_config:
             raise ValueError(
                 "[Primus:specforge] modules.pre_trainer must set 'specforge_config' "
                 "(path to the SpecForge YAML)."
@@ -74,12 +76,15 @@ class SpecForgeAdapter(BackendAdapter):
             overrides["output_dir"] = str(output_dir)
 
         root = resolve_specforge_root(params)
+        capture = flatten_overrides(getattr(params, "specforge_capture", None))
 
         backend_args = SimpleNamespace(
-            specforge_config=str(specforge_config),
+            specforge_mode=specforge_mode_value,
+            specforge_config=str(specforge_config) if specforge_config else None,
             specforge_entrypoint=str(getattr(params, "specforge_entrypoint", None) or DEFAULT_ENTRYPOINT),
             specforge_root=str(root) if root is not None else None,
             specforge_overrides=overrides,
+            specforge_capture=capture,
         )
 
         log_rank_0(

@@ -23,7 +23,11 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Optional
 
-from primus.backends.specforge.argument_builder import flatten_overrides, resolve_specforge_root
+from primus.backends.specforge.argument_builder import (
+    flatten_overrides,
+    resolve_specforge_root,
+    specforge_mode,
+)
 
 ROCM_STACK_ENV_DEFAULTS = (
     ("SGLANG_USE_AITER", "1"),
@@ -112,13 +116,17 @@ def collect_issues(params: Any, env: Optional[Mapping[str, str]] = None) -> list
 
     environ = os.environ if env is None else env
     issues: list[str] = []
+    mode = specforge_mode(params)
     overrides = flatten_overrides(getattr(params, "specforge_overrides", None))
+    capture = flatten_overrides(getattr(params, "specforge_capture", None))
 
     specforge_config = getattr(params, "specforge_config", None) or environ.get("SPECFORGE_CONFIG")
     if specforge_config:
         config_path = Path(str(specforge_config))
         if not config_path.is_file():
             issues.append(f"specforge_config is not a file: {config_path}")
+    elif mode != "capture":
+        issues.append("specforge_config is required for train")
 
     root = resolve_specforge_root(params, env=environ)
     if root is None:
@@ -129,13 +137,37 @@ def collect_issues(params: Any, env: Optional[Mapping[str, str]] = None) -> list
     elif not (root / "configs").is_dir():
         issues.append(f"SpecForge root is missing configs/: {root}")
 
-    hidden = _hidden_states_path(params, environ)
-    if hidden:
-        path = Path(str(hidden))
-        if not path.is_dir():
-            issues.append(f"Hidden-states path is not a directory: {path}")
-        elif not any(path.iterdir()):
-            issues.append(f"Hidden-states path is empty: {path}")
+    if mode == "capture":
+        data_path = capture.get("data_path") or environ.get("CAPTURE_DATA_PATH")
+        if not data_path:
+            issues.append("capture data_path is required (ShareGPT-style JSONL)")
+        elif not Path(str(data_path)).is_file():
+            issues.append(f"capture data_path is not a file: {data_path}")
+        output_path = capture.get("output_path")
+        if not output_path:
+            issues.append("capture output_path is required")
+        draft = capture.get("draft_model_config")
+        if draft and root is not None:
+            draft_path = Path(str(draft))
+            if not draft_path.is_absolute():
+                draft_path = root / draft_path
+            if not draft_path.is_file():
+                issues.append(f"draft model config is not a file: {draft_path}")
+        if capture.get("sglang_disable_radix_cache") in FALSEY or capture.get(
+            "sglang_disable_radix_cache"
+        ) == "false":
+            issues.append(
+                "capture sglang_disable_radix_cache is false; Mamba + AITER on ROCm "
+                "must disable the radix cache"
+            )
+    else:
+        hidden = _hidden_states_path(params, environ)
+        if hidden:
+            path = Path(str(hidden))
+            if not path.is_dir():
+                issues.append(f"Hidden-states path is not a directory: {path}")
+            elif not any(path.iterdir()):
+                issues.append(f"Hidden-states path is empty: {path}")
 
     liger = overrides.get("model.use_liger_kernel")
     if liger in TRUTHY or liger == "true":
