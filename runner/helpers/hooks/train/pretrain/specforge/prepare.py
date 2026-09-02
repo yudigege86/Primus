@@ -29,6 +29,7 @@ from primus.backends.specforge.stack_preflight import (
     collect_issues,
     enforce_rocm_stack,
 )
+from primus.backends.specforge.argument_builder import specforge_mode
 from primus.core.launcher.parser import load_primus_config
 from runner.helpers.hooks.train.pretrain.utils import log_error_and_exit, log_info
 
@@ -96,7 +97,9 @@ def main():
     except Exception:
         log_error_and_exit("Missing required module config: pre_trainer")
 
-    if not getattr(pre_trainer_cfg, "specforge_config", None):
+    if specforge_mode(pre_trainer_cfg) != "capture" and not getattr(
+        pre_trainer_cfg, "specforge_config", None
+    ):
         log_error_and_exit("Missing required field: pre_trainer.specforge_config")
 
     specforge_root = resolve_specforge_root(args.backend_path, pre_trainer_cfg)

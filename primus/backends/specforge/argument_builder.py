@@ -5,18 +5,22 @@
 ###############################################################################
 
 """
-Translate Primus module params into a SpecForge ``train`` command line.
+Translate Primus module params into a SpecForge command line.
 
 SpecForge is configured by its own Hydra-style YAML plus dotted ``key=value``
 overrides on the command line. Primus therefore does not rebuild SpecForge's
 config tree; it only points at a SpecForge config and forwards overrides.
+Offline capture is the same shape: Primus builds argv for SpecForge's
+``scripts/prepare_hidden_states.py`` and does not reimplement capture.
 
 Params consumed here:
 
-    specforge_config      Path to the SpecForge YAML (required)
+    specforge_config      Path to the SpecForge YAML (required for train)
     specforge_overrides   Nested mapping flattened to dotted Hydra overrides
     specforge_entrypoint  argv[0] for the SpecForge CLI (default ``specforge``)
     specforge_root        SpecForge checkout used as cwd (see resolve_specforge_root)
+    specforge_mode        ``train`` (default) or ``capture``
+    specforge_capture     Nested mapping of ``prepare_hidden_states.py`` flags
     output_dir            Convenience alias for ``specforge_overrides.output_dir``
 """
 
@@ -30,6 +34,34 @@ from typing import Any, Mapping, Optional
 from primus.core.utils.yaml_utils import nested_namespace_to_dict
 
 DEFAULT_ENTRYPOINT = "specforge"
+DEFAULT_CAPTURE_SCRIPT = "scripts/prepare_hidden_states.py"
+CAPTURE_STORE_TRUE = frozenset(
+    {
+        "trust_remote_code",
+        "is_preformatted",
+        "compress",
+        "sglang_enable_nccl_nvls",
+        "sglang_enable_symm_mem",
+        "sglang_enable_torch_compile",
+        "sglang_enable_dp_attention",
+        "sglang_enable_dp_lm_head",
+        "sglang_disable_radix_cache",
+    }
+)
+CAPTURE_SKIP_KEYS = frozenset(
+    {
+        "nproc_per_node",
+        "filter_output_path",
+        "filter_block_size",
+        "torchrun",
+        "script",
+    }
+)
+
+
+def specforge_mode(params: Any) -> str:
+    raw = getattr(params, "specforge_mode", None) or "train"
+    return str(raw).strip().lower()
 
 
 def _as_override_value(value: Any) -> str:
@@ -88,6 +120,47 @@ def build_specforge_argv(params: Any, extra_overrides: Optional[list[str]] = Non
     argv.extend(f"{key}={value}" for key, value in sorted(overrides.items()))
     if extra_overrides:
         argv.extend(extra_overrides)
+    return argv
+
+
+def _capture_flag_name(key: str) -> str:
+    return "--" + str(key).replace("_", "-")
+
+
+def _is_true_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_capture_argv(params: Any, extra_args: Optional[list[str]] = None) -> list[str]:
+    """Build ``torchrun … scripts/prepare_hidden_states.py`` for offline capture."""
+
+    capture = flatten_overrides(getattr(params, "specforge_capture", None))
+    nproc = capture.get("nproc_per_node") or os.environ.get("NPROC_PER_NODE") or "1"
+    torchrun = capture.get("torchrun") or "torchrun"
+    script = capture.get("script") or DEFAULT_CAPTURE_SCRIPT
+
+    argv = [
+        str(torchrun),
+        "--standalone",
+        "--nproc_per_node",
+        str(nproc),
+        str(script),
+    ]
+    for key, value in sorted(capture.items()):
+        if key in CAPTURE_SKIP_KEYS:
+            continue
+        flag = _capture_flag_name(key)
+        if key in CAPTURE_STORE_TRUE:
+            if _is_true_flag(value):
+                argv.append(flag)
+            continue
+        if value is None or str(value).lower() in {"none", "null", ""}:
+            continue
+        argv.extend([flag, str(value)])
+    if extra_args:
+        argv.extend(extra_args)
     return argv
 
 

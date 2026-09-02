@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 from primus.backends.specforge.argument_builder import (
+    build_capture_argv,
     build_specforge_argv,
     flatten_overrides,
     resolve_specforge_root,
@@ -30,6 +31,7 @@ from primus.backends.specforge.argument_builder import (
 from primus.backends.specforge.specforge_adapter import SpecForgeAdapter
 from primus.backends.specforge.specforge_pretrain_trainer import (
     SpecForgePretrainTrainer,
+    align_visible_devices,
     clear_partial_distributed_env,
 )
 from primus.backends.specforge.stack_preflight import (
@@ -42,6 +44,7 @@ from primus.core.launcher.parser import PrimusParser
 
 PRIMUS_ROOT = Path(__file__).resolve().parents[4]
 EXAMPLE_CONFIG = PRIMUS_ROOT / "examples" / "specforge" / "configs" / "qwen3.5-4b-dflash-offline.yaml"
+CAPTURE_CONFIG = PRIMUS_ROOT / "examples" / "specforge" / "configs" / "qwen3.5-4b-dflash-offline-capture.yaml"
 PREPARE_HOOK = PRIMUS_ROOT / "runner/helpers/hooks/train/pretrain/specforge/prepare.py"
 
 
@@ -52,6 +55,9 @@ def specforge_checkout(tmp_path):
     (root / "configs").mkdir(parents=True)
     (root / "pyproject.toml").write_text("[project]\nname = 'specforge'\n")
     (root / "configs" / "qwen3.5-4b-dflash.yaml").write_text("model: dummy\n")
+    (root / "configs" / "qwen3.5-4b-dflash.json").write_text("{}\n")
+    (root / "scripts").mkdir()
+    (root / "scripts" / "prepare_hidden_states.py").write_text("# stub\n")
     return root
 
 
@@ -73,7 +79,12 @@ def experiment_env(monkeypatch, specforge_checkout, hidden_states, tmp_path):
         "HIDDEN_STATES_PATH": str(hidden_states),
         "OUTPUT_DIR": str(tmp_path / "out"),
         "MAX_STEPS": "20",
+        "CAPTURE_DATA_PATH": str(tmp_path / "sharegpt.jsonl"),
+        "CAPTURE_BATCH_SIZE": "8",
+        "BLOCK_SIZE": "16",
+        "TARGET_MODEL": "Qwen/Qwen3.5-4B",
     }
+    (tmp_path / "sharegpt.jsonl").write_text("{}\n")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return env
@@ -189,6 +200,44 @@ class TestArgvBuilder:
         params = SimpleNamespace(specforge_config="/sf/a.yaml", specforge_entrypoint="specforge-wrapper")
         assert build_specforge_argv(params)[0] == "specforge-wrapper"
 
+    def test_capture_argv_runs_prepare_hidden_states(self):
+        params = SimpleNamespace(
+            specforge_mode="capture",
+            specforge_capture={
+                "target_model_path": "Qwen/Qwen3.5-4B",
+                "strategy": "dflash",
+                "trust_remote_code": True,
+                "sglang_disable_radix_cache": True,
+                "sglang_attention_backend": "aiter",
+                "nproc_per_node": 1,
+                "filter_output_path": "/filtered",
+            },
+        )
+        argv = build_capture_argv(params)
+        assert argv[:5] == [
+            "torchrun",
+            "--standalone",
+            "--nproc_per_node",
+            "1",
+            "scripts/prepare_hidden_states.py",
+        ]
+        assert "--trust-remote-code" in argv
+        assert "--sglang-disable-radix-cache" in argv
+        assert argv[argv.index("--sglang-attention-backend") + 1] == "aiter"
+        assert "filter_output_path" not in " ".join(argv)
+        assert "--target-model-path" in argv
+
+    def test_capture_omits_false_store_true_flags(self):
+        params = SimpleNamespace(
+            specforge_mode="capture",
+            specforge_capture={"sglang_disable_radix_cache": False, "trust_remote_code": "false"},
+        )
+        argv = build_capture_argv(params)
+        joined = " ".join(argv)
+        assert "--sglang-disable-radix-cache" not in argv
+        assert "--trust-remote-code" not in argv
+        assert "false" not in joined
+
 
 class TestWorkdirResolution:
     def test_explicit_param_wins(self, specforge_checkout, tmp_path, monkeypatch):
@@ -231,6 +280,21 @@ class TestExampleExperiment:
         assert f"output_dir={experiment_env['OUTPUT_DIR']}" in argv
         assert backend_args.specforge_root == experiment_env["SPECFORGE_ROOT"]
 
+    def test_capture_yaml_converts_to_prepare_hidden_states_argv(self, experiment_env):
+        module = load_pre_trainer_params(CAPTURE_CONFIG)
+        adapter = SpecForgeAdapter()
+        backend_args = adapter.convert_config(module.params)
+        assert backend_args.specforge_mode == "capture"
+        argv = build_capture_argv(backend_args)
+        assert "scripts/prepare_hidden_states.py" in argv
+        assert "--sglang-disable-radix-cache" in argv
+        assert "--sglang-disable-radix-cache false" not in " ".join(argv)
+        assert "--strategy" in argv
+        assert argv[argv.index("--strategy") + 1] == "dflash"
+        assert argv[argv.index("--data-path") + 1] == experiment_env["CAPTURE_DATA_PATH"]
+        assert Path(argv[argv.index("--output-path") + 1]) == Path(experiment_env["OUTPUT_DIR"]) / "hidden_states_raw"
+        assert "--filter-output-path" not in argv
+
     def test_trainer_rejects_missing_entrypoint(self, experiment_env):
         backend_args = SimpleNamespace(
             specforge_config=experiment_env["SPECFORGE_CONFIG"],
@@ -267,10 +331,65 @@ class TestDistributedEnvHandoff:
         assert clear_partial_distributed_env(env) == []
 
 
+class TestVisibleDeviceAlignment:
+    """base_env.sh widens HIP to the whole node; vLLM asserts HIP == CUDA (job 99815)."""
+
+    def test_whole_node_hip_is_narrowed_to_the_allocation(self):
+        env = {"HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", "CUDA_VISIBLE_DEVICES": "0"}
+        assert align_visible_devices(env) == ("0,1,2,3,4,5,6,7", "0")
+        assert env["HIP_VISIBLE_DEVICES"] == "0"
+
+    def test_matching_values_are_left_alone(self):
+        env = {
+            "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        }
+        assert align_visible_devices(env) is None
+        assert env["HIP_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+
+    def test_unset_cuda_keeps_hip(self):
+        env = {"HIP_VISIBLE_DEVICES": "0,1"}
+        assert align_visible_devices(env) is None
+        assert env["HIP_VISIBLE_DEVICES"] == "0,1"
+
+    def test_empty_env_is_a_noop(self):
+        env = {}
+        assert align_visible_devices(env) is None
+        assert env == {}
+
+
+class TestCaptureExitCode:
+    """Job 101977 captured 176 shards then primus-cli reported torchrun exit 1."""
+
+    def test_system_exit_zero_is_not_wrapped_as_training_failure(self):
+        from primus.core.runtime.train_runtime import TrainRuntime
+
+        runtime = TrainRuntime(args=SimpleNamespace())
+
+        def abort(*_args, **_kwargs):
+            raise SystemExit(0)
+
+        runtime._initialize_configuration = abort
+        with pytest.raises(SystemExit) as caught:
+            runtime.run_train_module("pre_trainer")
+        assert caught.value.code == 0
+
+    def test_capture_train_returns_after_successful_subprocess(self, monkeypatch):
+        trainer = SpecForgePretrainTrainer(
+            backend_args=SimpleNamespace(specforge_mode="capture", specforge_capture={})
+        )
+        trainer.argv = ["torchrun"]
+        monkeypatch.setattr(
+            "primus.backends.specforge.specforge_pretrain_trainer.subprocess.run",
+            lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+        )
+        assert trainer.train() is None
+
+
 class TestPrepareHook:
     """The hook must tell primus-cli to skip torchrun; SpecForge self-launches."""
 
-    def run_hook(self, env_overrides, extra_args=()):
+    def run_hook(self, env_overrides, extra_args=(), config=EXAMPLE_CONFIG):
         env = dict(os.environ)
         env.update(env_overrides)
         env["PYTHONPATH"] = os.pathsep.join([str(PRIMUS_ROOT), env.get("PYTHONPATH", "")])
@@ -279,7 +398,7 @@ class TestPrepareHook:
                 sys.executable,
                 str(PREPARE_HOOK),
                 "--config",
-                str(EXAMPLE_CONFIG),
+                str(config),
                 "--data_path",
                 str(PRIMUS_ROOT / "data"),
                 "--primus_path",
@@ -303,6 +422,14 @@ class TestPrepareHook:
         if enforce_rocm_stack({**experiment_env, **dict(os.environ)}):
             assert "env.SGLANG_USE_AITER=1" in result.stdout
             assert "env.SGLANG_DISABLE_RADIX_CACHE=1" in result.stdout
+
+    def test_capture_yaml_emits_single_run_mode(self, experiment_env):
+        result = self.run_hook(experiment_env, config=CAPTURE_CONFIG)
+        assert result.returncode == 0, result.stderr
+        assert "env.RUN_MODE=single" in result.stdout
+        assert "env.GPUS_PER_NODE=1" in result.stdout
+        combined = (result.stdout + result.stderr).lower()
+        assert "stack preflight ok" in combined
 
     def test_fails_fast_on_empty_hidden_states(self, experiment_env, tmp_path):
         empty = tmp_path / "empty_hidden_states"
@@ -377,6 +504,32 @@ class TestStackPreflight:
     def test_hip_visible_devices_opts_into_enforce(self):
         assert enforce_rocm_stack({"HIP_VISIBLE_DEVICES": "0"}, kind="missing") is True
         assert enforce_rocm_stack({}, kind="missing") is False
+
+    def test_capture_skips_hidden_states_existence(self, specforge_checkout, tmp_path):
+        data = tmp_path / "sharegpt.jsonl"
+        data.write_text("{}\n")
+        out = tmp_path / "raw"
+        params = SimpleNamespace(
+            specforge_mode="capture",
+            specforge_root=str(specforge_checkout),
+            specforge_capture={
+                "data_path": str(data),
+                "output_path": str(out),
+                "draft_model_config": "configs/qwen3.5-4b-dflash.json",
+                "sglang_disable_radix_cache": True,
+            },
+        )
+        issues = collect_issues(params, env={"PRIMUS_SPECFORGE_ENFORCE_ROCM": "0"})
+        assert issues == []
+
+    def test_capture_missing_data_path(self, specforge_checkout):
+        params = SimpleNamespace(
+            specforge_mode="capture",
+            specforge_root=str(specforge_checkout),
+            specforge_capture={"output_path": "/tmp/raw"},
+        )
+        issues = collect_issues(params, env={"PRIMUS_SPECFORGE_ENFORCE_ROCM": "0"})
+        assert any("data_path" in item for item in issues)
 
 
 class TestPrimusParserAcceptsSpecForge:

@@ -23,6 +23,13 @@ specforge_root: null
 # argv[0] for the SpecForge CLI; override to run a wrapper or a module form.
 specforge_entrypoint: specforge
 
+# train (default) execs `specforge train`. capture runs
+# scripts/prepare_hidden_states.py via torchrun, then optional DFlash filter.
+specforge_mode: train
+
+# Flags for prepare_hidden_states.py when specforge_mode=capture.
+specforge_capture: {}
+
 # Convenience alias for specforge_overrides.output_dir.
 output_dir: null
 
