@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -37,6 +37,26 @@ LOG_INFO_RANK0() {
     fi
 }
 LOG_ERROR() { echo "[NODE-$NODE_RANK($HOSTNAME)] [ERROR] $*"; }
+
+# JAX backends (MaxText, MaxDiffusion) are launched WITHOUT torchrun, install
+# requirements-jax.txt, and skip the torch/NCCL-only env. Returns 0 (true) for
+# any JAX backend, matched case-insensitively against $BACKEND.
+_is_jax_backend() {
+    case "$(printf '%s' "${BACKEND:-}" | tr '[:upper:]' '[:lower:]')" in
+        maxtext|maxdiffusion) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# MaxDiffusion needs its own (separate-from-MaxText) JAX dep stack + source
+# patches. When running from a bare Primus checkout (no MAD maxdiffusion image),
+# examples/maxdiffusion/setup_maxdiffusion_env.sh installs/patches it in-venv.
+_is_maxdiffusion_backend() {
+    case "$(printf '%s' "${BACKEND:-}" | tr '[:upper:]' '[:lower:]')" in
+        maxdiffusion) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 EXAMPLE_FAULT_TOLERANCE() {
     for arg in "$@"; do
@@ -89,13 +109,38 @@ PRIMUS_PATH=$(realpath "$(dirname "$0")/..")
 export DATA_PATH=${DATA_PATH:-"${PRIMUS_PATH}/data"}
 export HF_HOME=${HF_HOME:-"${DATA_PATH}/huggingface"}
 
+# shellcheck source=/dev/null
 source "${PRIMUS_PATH}/runner/helpers/envs/path_utils.sh"
 
-LOG_INFO_RANK0 "Pip installing required packages ..."
-if [ "${BACKEND:-}" != "MaxText" ]; then
-    pip install -r "$PRIMUS_PATH/requirements.txt"  --quiet
+# MaxDiffusion backend: own the JAX/torch dep stack + source location in Primus
+# (vendored third_party/maxdiffusion submodule), independent of the MaxText image.
+if _is_maxdiffusion_backend; then
+    export NVTE_FRAMEWORK="${NVTE_FRAMEWORK:-jax}"
+    export MAXDIFFUSION_PATH="${MAXDIFFUSION_PATH:-$PRIMUS_PATH/third_party/maxdiffusion}"
+    # Multi-node JAX coordination. MaxDiffusion's GPU init
+    # (max_utils.initialize_jax_for_gpu) only calls jax.distributed.initialize()
+    # when JAX_COORDINATOR_IP is set, using num_processes=NNODES / process_id=NODE_RANK
+    # (one process per node). Mirror the MaxText env_spec so a 2+ node run rendezvous
+    # instead of each node silently initializing as a standalone single-node job.
+    export JAX_COORDINATOR_IP="${JAX_COORDINATOR_IP:-$MASTER_ADDR}"
+    export JAX_COORDINATOR_PORT="${JAX_COORDINATOR_PORT:-$MASTER_PORT}"
+fi
+
+# PRIMUS_SKIP_PIP=1 skips the per-run pip install (deps already ship in the base
+# image). Use it when many ranks/nodes share one venv and concurrent pip installs
+# would race, or simply to speed up a warm container. Not keyed on the launcher.
+if [ "${PRIMUS_SKIP_PIP:-0}" == "1" ]; then
+    LOG_INFO_RANK0 "PRIMUS_SKIP_PIP=1: skipping pip install (deps from image)"
+elif _is_maxdiffusion_backend; then
+    LOG_INFO_RANK0 "MaxDiffusion backend: setting up maxdiffusion env from Primus ..."
+    bash "$PRIMUS_PATH/examples/maxdiffusion/setup_maxdiffusion_env.sh"
 else
-    pip install -r "$PRIMUS_PATH/requirements-jax.txt"  --quiet
+    LOG_INFO_RANK0 "Pip installing required packages ..."
+    if ! _is_jax_backend; then
+        pip install -r "$PRIMUS_PATH/requirements.txt"  --quiet
+    else
+        pip install -r "$PRIMUS_PATH/requirements-jax.txt"  --quiet
+    fi
 fi
 
 
@@ -117,7 +162,27 @@ if [ ! -f "${EXP}" ]; then
     exit 1
 fi
 
-TRAIN_LOG=${TRAIN_LOG:-"output/log_mp_pretrain_$(basename "$EXP" .yaml).txt"}
+# -------------------- Hybrid model (GDN/KDA/Mamba) FLA Triton patch --------------------
+# Hylo hybrid configs and pure KDA/GDN configs under examples/megatron/configs/
+# depend on flash-linear-attention (FLA) Triton kernels that hang during
+# autotuning with num_stages >= 3 on MI300X/ROCm. Auto-apply the workaround whenever
+# one of those configs is used. See tools/hybrid/patch_fla_triton_autotune_hang.sh for details.
+EXP_BASENAME=$(basename "${EXP}")
+if [[ "${EXP_BASENAME}" == hylo_* || "${EXP_BASENAME}" == kda_* || "${EXP_BASENAME}" == gdn_* || "${EXP_BASENAME}" == hylo_llama_* ]]; then
+    LOG_INFO_RANK0 "Detected hybrid model config (${EXP_BASENAME}); applying FLA Triton autotune-hang patch ..."
+    if ! bash "${PRIMUS_PATH}/tools/hybrid/patch_fla_triton_autotune_hang.sh"; then
+        LOG_ERROR "FLA Triton autotune-hang patch failed; continuing, but training may hang during autotuning."
+    fi
+fi
+
+if [ -z "${TRAIN_LOG:-}" ]; then
+    RUN_FOLDER=$(python3 -c "
+import yaml, sys
+d = yaml.safe_load(open(sys.argv[1]))
+print(f\"{d.get('workspace','./output')}/{d.get('work_group','default')}/{d.get('user_name','unknown')}/{d.get('exp_name','experiment')}\")
+" "$EXP" 2>/dev/null || echo "output")
+    TRAIN_LOG="${RUN_FOLDER}/train.log"
+fi
 
 LOG_INFO_RANK0 "==========Training info=========="
 LOG_INFO_RANK0 "EXP: $EXP"
@@ -132,13 +197,22 @@ LOG_INFO_RANK0 ""
 
 HIP_VISIBLE_DEVICES=$(seq -s, 0 $((GPUS_PER_NODE - 1)))
 export HIP_VISIBLE_DEVICES
-ensure_rocm_ld_library_path
+
+# Skip LD_LIBRARY_PATH injection for JAX backends (MaxText/MaxDiffusion): the
+# image-installed JAX already links against the correct ROCm libs; prepending
+# _rocm_sdk_devel/lib pulls in TE 2.17's broken hipblaslt Tensile kernels on gfx950.
+if [[ "${BACKEND:-}" != "MaxText" && "${BACKEND:-}" != "MaxDiffusion" ]]; then
+    ensure_rocm_ld_library_path
+fi
 
 export NCCL_DEBUG=${NCCL_DEBUG:-}
 export NCCL_CHECKS_DISABLE=1
 
 if [ "$USING_AINIC" == "1" ]; then
     LOG_INFO_RANK0 "Using AINIC"
+    # ROCm 7.2.1+ builds ANP into RCCL; RCCL_AINIC_ROCE=1 enables the built-in ANP
+    # path. An explicitly-set NCCL_NET_PLUGIN below still takes precedence.
+    export RCCL_AINIC_ROCE="${RCCL_AINIC_ROCE:-1}"
     export NCCL_IB_GID_INDEX=1
     export NCCL_IB_TC=${NCCL_IB_TC:-104}
     export NCCL_IB_FIFO_TC=${NCCL_IB_FIFO_TC:-192}
@@ -158,7 +232,12 @@ if [ "$USING_AINIC" == "1" ]; then
         "${RCCL_HOME_DIR}/build/release" \
         "${ANP_HOME_DIR}/build" \
         "${MPI_HOME_DIR}/lib"
-    if [ -n "${NCCL_NET_PLUGIN:-}" ]; then
+    # With built-in ANP (RCCL_AINIC_ROCE=1) default to "none" so RCCL uses its
+    # built-in ANP transport instead of auto-loading an external plugin. An
+    # explicitly-set NCCL_NET_PLUGIN always wins.
+    if [ "${RCCL_AINIC_ROCE}" = "1" ]; then
+        export NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"
+    elif [ -n "${NCCL_NET_PLUGIN:-}" ]; then
         export NCCL_NET_PLUGIN
     elif [ -f "${ANP_HOME_DIR}/build/librccl-anp.so" ]; then
         export NCCL_NET_PLUGIN=librccl-anp.so
@@ -195,14 +274,27 @@ LOG_INFO "GLOO_SOCKET_IFNAME: $GLOO_SOCKET_IFNAME"
 LOG_INFO ""
 
 # ----------------- AMD-specific GPU optimizations -----------------
-export HSA_ENABLE_SDMA=1
-export HSA_NO_SCRATCH_RECLAIM=${HSA_NO_SCRATCH_RECLAIM:-0}
+
+# Enable system DMA engine (SDMA) on AMD GPUs for better IO throughput.
+# ${:-} guarded so a caller can set HSA_ENABLE_SDMA=0 to route copies through
+# blit/compute kernels instead — workaround for hosts where an SDMA H2D copy
+# intermittently never signals completion (hangs in BusyWaitSignal).
+export HSA_ENABLE_SDMA=${HSA_ENABLE_SDMA:-1}
+
+# Prevent scratch memory from being reclaimed to stabilize large memory usage patterns (e.g., KV cache, MoE experts)
+# NOTE: Must disable scratch reclaim to avoid MoE training crash on AMD GPUs
+# Setting this to 0 prevents core dumps when using Mixture-of-Experts (MoE) models.
+# MaxText intentionally skipped here: its adapter owns HSA_NO_SCRATCH_RECLAIM
+# (gfx942 => 1; unset on gfx950) via env_spec.py, so we must not pre-set it.
+if [ "${BACKEND:-}" != "MaxText" ]; then
+    export HSA_NO_SCRATCH_RECLAIM=${HSA_NO_SCRATCH_RECLAIM:-0}
+fi
 export RCCL_MSCCL_ENABLE=0
 export RCCL_MSCCLPP_ENABLE=0
 export RCCL_MSCCLPP_FORCE_ENABLE=0
 export RCCL_MSCCLPP_THRESHOLD=$((1*1024*1024*1024))
 export MSCCLPP_DISABLE_CHANNEL_CACHE=FALSE
-if [ "${BACKEND:-}" != "MaxText" ]; then
+if ! _is_jax_backend; then
     export TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=0
 fi
 
@@ -216,7 +308,7 @@ LOG_INFO_RANK0 ""
 export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-2}
 export ENABLE_NUMA_BINDING=${ENABLE_NUMA_BINDING:-0}
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
-if [ "${BACKEND:-}" != "MaxText" ]; then
+if ! _is_jax_backend; then
     export TORCH_NCCL_HIGH_PRIORITY=${TORCH_NCCL_HIGH_PRIORITY:-1}
 fi
 
@@ -227,9 +319,16 @@ export NCCL_PXN_DISABLE=${NCCL_PXN_DISABLE:-0}
 export NCCL_P2P_NET_CHUNKSIZE=${NCCL_P2P_NET_CHUNKSIZE:-524288}
 export NVTE_USE_CAST_TRANSPOSE_TRITON=${NVTE_USE_CAST_TRANSPOSE_TRITON:-1}
 export NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE=${NVTE_USE_OPTIMIZED_HIPIFIED_CAST_TRANSPOSE:-0}
-export NVTE_ROCM_ENABLE_MXFP8=1
+export NVTE_ROCM_ENABLE_MXFP8=${NVTE_ROCM_ENABLE_MXFP8:-1}
 export NVTE_CK_USES_BWD_V3=${NVTE_CK_USES_BWD_V3:-1}
 export PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32=${PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32:-0}
+
+# NOTE (MaxText): all MaxText/JAX perf + arch env (XLA_FLAGS incl. the fp8 MoE
+# --xla_gpu_autotune_level fix, NVTE/HIP/HSA tunables, and the arch-gated
+# RCCL_WARP_SPEED_AUTO/HSA_NO_SCRATCH_RECLAIM) is owned by the Primus MaxText
+# backend adapter (primus/backends/maxtext/env_spec.py), applied in-process before
+# JAX init. This launcher intentionally sets NO MaxText perf/arch env so there is a
+# single source of truth. See primus/core/backend/env_registry.py.
 
 if [ "${PRIMUS_DETERMINISTIC:-}" == "1" ]; then
     export NCCL_ALGO="Ring"
@@ -339,7 +438,9 @@ fi
 
 
 # -------------------- Launch Training --------------------
-if [ "${BACKEND:-}" == "MaxText" ]; then
+if _is_jax_backend; then
+    # JAX backends (MaxText, MaxDiffusion) manage devices themselves; launch a
+    # single plain-python process (no torchrun).
     CMD="python primus/cli/main.py train pretrain --config $EXP $TRAIN_EXTRA_ARGS $*"
 else
     DISTRIBUTED_ARGS=(

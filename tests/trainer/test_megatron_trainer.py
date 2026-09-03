@@ -7,9 +7,23 @@
 
 import os
 import re
+import socket
+import subprocess
+import sys
 import unittest
 
+import pytest
+
 from tests.utils import PrimusUT, run_training_script
+
+
+def _find_free_port() -> int:
+    """Ask the kernel for a free TCP port (bind to 0); avoids EADDRINUSE from
+    guessing a port that overlaps the ephemeral range or a not-yet-released one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 
 _GFX_TO_PLATFORM = {
     "gfx942": "MI300X",
@@ -71,7 +85,66 @@ def run_script(
     return run_training_script(tag=tag, cmd=cmd, train_log_path=train_log_path, env=env)
 
 
+def run_posttrain_script(
+    ut_name: str,
+    tag: str,
+    exp_path: str,
+    env_override: dict = None,
+    extra_args: list[str] = None,
+):
+    """Like run_script, but for the "posttrain" suite (SFT/alignment).
+
+    SFT experiment configs declare a `modules.post_trainer` section (instead
+    of `modules.pre_trainer`), which the CLI only loads via `train posttrain`
+    (see primus/cli/subcommands/train.py). The "Training completed." marker
+    that run_training_script asserts on is emitted generically by
+    PrimusRuntime._run_trainer_lifecycle for any module, so it applies here
+    unchanged.
+    """
+    shell_entry = "./runner/primus-cli"
+    env = os.environ.copy()
+    if env_override:
+        env.update(env_override)
+    env["EXP"] = exp_path
+
+    ut_log_path = os.environ.get("UT_LOG_PATH", "ut_out")
+    train_log_path = os.path.join(ut_log_path, f"log.test_megatron_trainer-{tag}.txt")
+    env["TRAIN_LOG"] = train_log_path
+
+    cmd = [
+        "bash",
+        shell_entry,
+        "direct",
+        "--log_file",
+        train_log_path,
+        "--",
+        "train",
+        "posttrain",
+        "--config",
+        exp_path,
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    return run_training_script(tag=tag, cmd=cmd, train_log_path=train_log_path, env=env)
+
+
 class TestMegatronTrainer(PrimusUT):
+    """One model per architecture, plus one case per feature path.
+
+    Every case is a full training launch, so a model that only scales the dims
+    of a sibling earns no coverage and does not belong here: qwen3_235B_A22B
+    (same template as qwen3_30B_A3B) and mixtral_8x22B (same template as
+    mixtral_8x7B, whose recipe additionally covers DeepEP / sync-free MoE) were
+    removed for that reason. Their example yamls are still schema-checked by
+    tests/unit_tests/configs/test_example_configs.py.
+
+    Before adding a model, check it is not isomorphic to one already here, and
+    before removing one, check it is not the last user of a feature path --
+    llama3_70B for instance is the only recipe that enables use_torch_fsdp2.
+    See tests/README.md.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -86,6 +159,26 @@ class TestMegatronTrainer(PrimusUT):
             self.__class__.__name__,
             "llama3_8B",
             exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/llama3_8B-BF16-pretrain.yaml",
+            env_override={},
+            extra_args=[
+                "--num_layers",
+                "4",
+                "--train_iters",
+                "3",
+                "--enable_primus_turbo",
+                "1",
+                "--use_turbo_attention",
+                "1",
+            ],
+        )
+
+    # The only dense FP8 case; every other FP8 case here is MoE.
+    @pytest.mark.weekly
+    def test_llama3_8B_fp8(self):
+        run_script(
+            self.__class__.__name__,
+            "llama3_8B_fp8",
+            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/llama3_8B-FP8-pretrain.yaml",
             env_override={},
             extra_args=[
                 "--num_layers",
@@ -171,40 +264,9 @@ class TestMegatronTrainer(PrimusUT):
             ],
         )
 
-    def test_qwen3_235B_A22B(self):
-        run_script(
-            self.__class__.__name__,
-            "qwen3_235B_A22B",
-            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/qwen3_235B_A22B-BF16-pretrain.yaml",
-            env_override={},
-            extra_args=[
-                "--num_layers",
-                "4",
-                "--moe_layer_freq",
-                "[0]*1+[1]*3",
-                "--train_iters",
-                "3",
-                "--micro_batch_size",
-                "1",
-                "--global_batch_size",
-                "8",
-                "--expert_model_parallel_size",
-                "8",
-                "--pipeline_model_parallel_size",
-                "1",
-                "--recompute_granularity",
-                "full",
-                "--recompute_method",
-                "block",
-                "--recompute_num_layers",
-                "0",
-                "--enable_primus_turbo",
-                "1",
-                "--use_turbo_attention",
-                "1",
-            ],
-        )
-
+    # Its gated_delta_net attention is an experimental variant and needs
+    # flash-linear-attention; qwen3 MoE stays covered per-PR by qwen3_30B_A3B.
+    @pytest.mark.weekly
     def test_qwen3_5_35B_A3B(self):
         run_script(
             self.__class__.__name__,
@@ -289,6 +351,9 @@ class TestMegatronTrainer(PrimusUT):
             ],
         )
 
+    # Secondary architecture; MoE with expert parallelism stays covered per-PR by
+    # deepseek_v2_lite and qwen3_30B_A3B.
+    @pytest.mark.weekly
     def test_mixtral_8x7B(self):
         run_script(
             self.__class__.__name__,
@@ -315,11 +380,14 @@ class TestMegatronTrainer(PrimusUT):
             ],
         )
 
-    def test_mixtral_8x22B(self):
+    # Its own architecture: rope scaling, qk_layernorm and shared-expert overlap
+    # on every layer.
+    @pytest.mark.weekly
+    def test_llama4_17B16E(self):
         run_script(
             self.__class__.__name__,
-            "mixtral_8x22B_v0.1",
-            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/mixtral_8x22B_v0.1-BF16-pretrain.yaml",
+            "llama4_17B16E",
+            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/llama4_17B16E-BF16-pretrain.yaml",
             env_override={},
             extra_args=[
                 "--num_layers",
@@ -330,19 +398,14 @@ class TestMegatronTrainer(PrimusUT):
                 "1",
                 "--global_batch_size",
                 "8",
-                "--moe_layer_freq",
-                "1",
                 "--expert_model_parallel_size",
                 "8",
-                "--pipeline_model_parallel_size",
-                "1",
-                "--enable_primus_turbo",
-                "1",
-                "--use_turbo_attention",
-                "1",
             ],
         )
 
+    # Secondary architecture; PP+VPP stay covered per-PR by deepseek_v3 and
+    # test_interleaved_pipeline_parallelism.
+    @pytest.mark.weekly
     def test_grok2(self):
         run_script(
             self.__class__.__name__,
@@ -468,6 +531,10 @@ class TestMegatronTrainer(PrimusUT):
                 "1",
                 "--use_turbo_grouped_gemm",
                 "1",
+                # use_turbo_grouped_gemm is incompatible with the config's default
+                # moe_use_legacy_grouped_gemm=True, so disable the legacy path.
+                "--moe_use_legacy_grouped_gemm",
+                "0",
             ],
         )
 
@@ -534,6 +601,9 @@ class TestMegatronTrainer(PrimusUT):
                 "0",
                 "--moe_use_legacy_grouped_gemm",
                 "0",
+                # Sync-Free MoE stage 3 requires PrimusTurboGroupedLinear.
+                "--use_turbo_grouped_gemm",
+                "1",
                 "--turbo_sync_free_moe_stage",
                 "3",
                 "--use_turbo_attention",
@@ -550,6 +620,121 @@ class TestMegatronTrainer(PrimusUT):
             Dataloader_mp_context_patch_log in stdout
         ), "Expected dataloader_mp_context patch log not found in stdout"
 
+    # A fused-op combination on top of llama3_8B, which stays covered per-PR.
+    @pytest.mark.weekly
+    def test_sdma_allgather_fused_residual_norm(self):
+        # Neither patch runs in any other case here: SDMA param all-gather
+        # only activates with ENABLE_SDMA_ALLGATHER=1 (env var, not a --arg) +
+        # a distributed optimizer; fused residual+RMSNorm needs
+        # use_turbo_rms_norm=1 + PRIMUS_FUSED_RESIDUAL_NORM_V2=1. Confirmed via
+        # coverage instrumentation that both patches install and execute.
+        run_script(
+            self.__class__.__name__,
+            "sdma_allgather_fused_residual_norm",
+            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/llama3_8B-BF16-pretrain.yaml",
+            env_override={
+                "ENABLE_SDMA_ALLGATHER": "1",
+                "PRIMUS_FUSED_RESIDUAL_NORM_V2": "1",
+            },
+            extra_args=[
+                "--num_layers",
+                "4",
+                "--train_iters",
+                "3",
+                "--enable_primus_turbo",
+                "1",
+                "--use_turbo_attention",
+                "1",
+                "--use_turbo_rms_norm",
+                "1",
+                "--use_distributed_optimizer",
+                "1",
+                "--overlap_param_gather",
+                "1",
+            ],
+        )
+
+    def test_mamba_370M(self):
+        # Default `auto` attention backend exercises attention_backend_patches:
+        # megatron-core's probe must respect the image's baked NVTE_FLASH_ATTN=0.
+        run_script(
+            self.__class__.__name__,
+            "mamba_370M",
+            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/mamba_370M-pretrain.yaml",
+            env_override={},
+            extra_args=[
+                "--num_layers",
+                "4",
+                "--train_iters",
+                "3",
+                "--micro_batch_size",
+                "2",
+                "--global_batch_size",
+                "16",
+            ],
+        )
+
+    def test_hylo_mamba_1B_hybrid(self):
+        # Hybrid Mamba+MLA (HybridStack) path. num_layers=8 is the minimum that
+        # keeps the default hybrid_attention_ratio=0.25 from allocating zero
+        # attention layers (division by zero).
+        run_script(
+            self.__class__.__name__,
+            "hylo_mamba_1B_hybrid",
+            exp_path=f"examples/megatron/configs/{GPU_PLATFORM}/hylo_llama_mamba_1B_BF16-pretrain.yaml",
+            env_override={},
+            extra_args=[
+                "--num_layers",
+                "8",
+                "--train_iters",
+                "3",
+                "--micro_batch_size",
+                "2",
+                "--global_batch_size",
+                "16",
+            ],
+        )
+
+    def test_mamba_130M_bridge_pretrain(self):
+        # Only E2E covering the megatron_bridge backend (mamba/hylo above use
+        # the megatron backend). extra_args pin a tiny shape so the test doesn't
+        # depend on the example yaml's sizes. Don't override seq_length: the
+        # recipe feeds it to both model and dataset but a CLI override reaches
+        # only the dataset, and Bridge asserts the two match.
+        run_script(
+            self.__class__.__name__,
+            "mamba_130M_bridge_pretrain",
+            exp_path=f"examples/megatron_bridge/configs/{GPU_PLATFORM}/mamba_130M_pretrain.yaml",
+            env_override={},
+            extra_args=[
+                "--train_iters",
+                "3",
+                "--micro_batch_size",
+                "1",
+                "--global_batch_size",
+                "8",
+            ],
+        )
+
+    def test_qwen2_sft_lora(self):
+        # Only E2E covering the "posttrain" suite (MegatronSFTTrainer) and
+        # peft/*.py; LoRA is enabled in test_megatron_trainer_sft_lora.yaml.
+        # The posttrain hook HF->Megatron-converts `tokenizer_model` into the
+        # base checkpoint when pretrained_checkpoint/load are unset, so this
+        # uses a tiny stand-in checkpoint, not real Qwen2.5-7B weights.
+        run_posttrain_script(
+            self.__class__.__name__,
+            "qwen2_sft_lora",
+            exp_path="tests/trainer/test_megatron_trainer_sft_lora.yaml",
+            env_override={},
+            # head_dim (2) is below the image's fused-attention CK kernel minimum,
+            # so pin the unfused path; attention_backend_patches forces it over
+            # the image's baked NVTE_FUSED_ATTN=1.
+            extra_args=["--attention_backend", "unfused"],
+        )
+
+    # UEP variant; the deepep path stays covered per-PR by test_turbo_deepep.
+    @pytest.mark.weekly
     def test_deepseekv2_lite_uep(self):
         run_script(
             self.__class__.__name__,
@@ -632,6 +817,10 @@ class TestMegatronTrainer(PrimusUT):
         self.assertIn("Training completed.", stdout)
         return stdout
 
+    # The three zbv cases below differ only in wgrad-split backend (TE / turbo /
+    # legacy grouped GEMM), and at 8 layers with PP=4 VPP=2 each costs more than
+    # the 4-layer cases above.
+    @pytest.mark.weekly
     def test_deepseek_v2_lite_te_fp8_zbv_formatted(self):
         stdout = self._run_deepseek_v2_lite_zbv_fp8_case(
             "deepseek_v2_lite_te_fp8_zbv_formatted",
@@ -643,6 +832,7 @@ class TestMegatronTrainer(PrimusUT):
         self.assertIn("[Patch:megatron.pp.te_wgrad_split]", stdout)
         self.assertNotIn("[Patch:megatron.pp.legacy_grouped_mlp_wgrad_split]", stdout)
 
+    @pytest.mark.weekly
     def test_deepseek_v2_lite_turbo_bf16_zbv_formatted(self):
         stdout = self._run_deepseek_v2_lite_zbv_fp8_case(
             "deepseek_v2_lite_turbo_fp8_zbv_formatted",
@@ -659,6 +849,7 @@ class TestMegatronTrainer(PrimusUT):
         )
         self.assertNotIn("[Patch:megatron.pp.legacy_grouped_mlp_wgrad_split]", stdout)
 
+    @pytest.mark.weekly
     def test_deepseek_v2_lite_bf16_lagacy_gg_zbv_formatted(self):
         stdout = self._run_deepseek_v2_lite_zbv_fp8_case(
             "deepseek_v2_lite_bf16_lagacy_gg_zbv_formatted",
@@ -674,7 +865,16 @@ class TestMegatronTrainer(PrimusUT):
         self.assertIn("[Patch:megatron.pp.legacy_grouped_mlp_wgrad_split]", stdout)
 
 
+@pytest.mark.weekly
 class TestMegatronTrainerDeterministic(PrimusUT):
+    """Bitwise reproducibility, weekend-only.
+
+    Every case here runs the same config twice and compares the losses as
+    strings, so each one costs two full training launches. Determinism breaks
+    from the kernel/collective stack rather than from a typical PR, so the pair
+    is not worth ~4 launches on the per-PR path.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -763,6 +963,118 @@ class TestMegatronTrainerDeterministic(PrimusUT):
         )
 
         assert self.check_numerical_reproducility(stdout, stdout_ref)
+
+
+class TestProjectionSimulate(PrimusUT):
+    """Projection is an offline planner that training E2E never runs, so it gets no
+    E2E coverage otherwise. Two paths are exercised so the coverage .pth records them:
+
+    - simulate (no GPU): origami/SDPA backends, multinode scaling, CLI orchestration.
+      A dense + a MoE config; the MoE one adds the expert-parallel / All-to-All /
+      router / grouped-GEMM branches the dense config never reaches.
+    - benchmark (real GPU layer): _run_layer_benchmark / benchmark_layer /
+      memory_capture paths that simulate cannot reach, launched via primus-cli so
+      torchrun sets up the distributed env the real layer bench requires.
+
+    Projection auto-limits the stack to 1-2 layers, so all cases are quick."""
+
+    _DENSE = "llama3.1_8B-BF16-pretrain.yaml"
+    _MOE = "mixtral_8x7B_v0.1-BF16-pretrain.yaml"
+    _BENCH = "qwen2.5_7B-BF16-pretrain.yaml"
+
+    def _check(self, result) -> str:
+        # returncode is the robust E2E-smoke contract: projection raises on any
+        # real error (bad config/arch, missing data, gated model, ...) which the
+        # CLI turns into a non-zero exit. We deliberately do NOT assert on result
+        # text -- the result-line wording differs per path (simulate/benchmark,
+        # dense/MoE/PP) and is brittle to reword.
+        self.assertEqual(result.returncode, 0, msg=(result.stdout[-1500:] + result.stderr[-1500:]))
+        return result.stdout
+
+    def _run_simulate(self, suite: str, mode_flag: str, model: str, extra: list | None = None) -> str:
+        config = f"examples/megatron/configs/{GPU_PLATFORM}/{model}"
+        cmd = [
+            sys.executable,
+            "-m",
+            "primus.cli.main",
+            "projection",
+            suite,
+            "--config",
+            config,
+            mode_flag,
+            "simulate",
+            "--gpu-arch",
+            GPU_PLATFORM.lower(),
+            "--target-nodes",
+            "4",
+            *(extra or []),
+        ]
+        return self._check(subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy()))
+
+    def _run_benchmark(self, suite: str, mode_flag: str) -> str:
+        # Real GPU layer bench needs torchrun's distributed env -> go through
+        # the primus-cli launcher (a plain subprocess won't set NNODES/NODE_RANK).
+        config = f"examples/megatron/configs/{GPU_PLATFORM}/{self._BENCH}"
+        cmd = [
+            "bash",
+            "./runner/primus-cli",
+            "direct",
+            "--",
+            "projection",
+            suite,
+            "--config",
+            config,
+            mode_flag,
+            "benchmark",
+            "--benchmark-gpus",
+            "8",
+            "--target-nodes",
+            "2",
+        ]
+        env = os.environ.copy()
+        # Kernel-assigned free port so back-to-back GPU benches don't hit
+        # EADDRINUSE (a fixed/random port can clash with a not-yet-released
+        # previous run or the ephemeral range).
+        env["MASTER_PORT"] = str(_find_free_port())
+        return self._check(subprocess.run(cmd, capture_output=True, text=True, env=env))
+
+    def test_performance_simulate_dense(self):
+        self._run_simulate("performance", "--profiling-mode", self._DENSE)
+
+    def test_memory_simulate_dense(self):
+        self._run_simulate("memory", "--memory-mode", self._DENSE)
+
+    def test_performance_simulate_moe(self):
+        # --target-ep-size drives the expert-parallel projection path.
+        self._run_simulate("performance", "--profiling-mode", self._MOE, extra=["--target-ep-size", "8"])
+
+    def test_memory_simulate_moe(self):
+        self._run_simulate("memory", "--memory-mode", self._MOE)
+
+    def test_performance_simulate_pp(self):
+        # PP>1 is the only thing that runs the pipeline-scheduler simulator
+        # (simulator.py); the PP=1 configs all skip pipeline simulation.
+        self._run_simulate(
+            "performance", "--profiling-mode", self._DENSE, extra=["--pipeline_model_parallel_size", "4"]
+        )
+
+    def _require_2_gpus(self):
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            self.skipTest("projection benchmark needs >=2 GPUs")
+
+    def test_performance_benchmark(self):
+        # Real GPU layer bench: covers _run_layer_benchmark / benchmark_layer /
+        # utils.benchmark_layer that simulate can't reach.
+        self._require_2_gpus()
+        self._run_benchmark("performance", "--profiling-mode")
+
+    def test_memory_benchmark(self):
+        # Real GPU memory capture: covers memory_projection/benchmark.py +
+        # memory_capture.py (HBM peak hooks) that simulate can't reach.
+        self._require_2_gpus()
+        self._run_benchmark("memory", "--memory-mode")
 
 
 if __name__ == "__main__":

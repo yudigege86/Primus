@@ -362,9 +362,9 @@ class TestCaptureExitCode:
     """Job 101977 captured 176 shards then primus-cli reported torchrun exit 1."""
 
     def test_system_exit_zero_is_not_wrapped_as_training_failure(self):
-        from primus.core.runtime.train_runtime import TrainRuntime
+        from primus.core.runtime.train_runtime import PrimusRuntime
 
-        runtime = TrainRuntime(args=SimpleNamespace())
+        runtime = PrimusRuntime(args=SimpleNamespace())
 
         def abort(*_args, **_kwargs):
             raise SystemExit(0)

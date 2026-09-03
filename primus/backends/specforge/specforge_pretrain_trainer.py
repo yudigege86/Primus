@@ -32,7 +32,7 @@ from primus.backends.specforge.argument_builder import (
 )
 from primus.backends.specforge.stack_preflight import raise_if_issues
 from primus.core.trainer.base_trainer import BaseTrainer
-from primus.modules.module_utils import log_rank_0, warning_rank_0
+from primus.core.utils.module_utils import log_rank_0, warning_rank_0
 
 # SpecForge treats these as one unit: it accepts all of them or none of them.
 TORCHRUN_RANK_VARS = ("RANK", "WORLD_SIZE", "LOCAL_RANK")
@@ -93,8 +93,11 @@ def clear_partial_distributed_env(env=None) -> list:
 class SpecForgePretrainTrainer(BaseTrainer):
     """Trainer that hands off to the SpecForge CLI."""
 
-    def __init__(self, backend_args: Any):
-        super().__init__(backend_args=backend_args)
+    def __init__(self, backend_args: Any, **kwargs):
+        # Current Primus passes BaseModule-style runtime context to every
+        # trainer. BaseTrainer filters it for trainers that do not mix in
+        # BaseModule, but subclasses still need to accept and forward it.
+        super().__init__(backend_args=backend_args, **kwargs)
         self.argv: Optional[list[str]] = None
         self.workdir: Optional[str] = None
         log_rank_0("Initialized SpecForgePretrainTrainer")

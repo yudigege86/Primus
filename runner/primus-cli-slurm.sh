@@ -17,8 +17,11 @@ Usage:
 Description:
     Launch distributed Primus jobs via Slurm.
     - Everything before the first '--' is passed to Slurm (srun/sbatch and flags).
-    - <entry> specifies Primus execution mode: container | direct | preflight (see below).
+    - <entry> specifies Primus execution mode: container | direct  (default: container).
     - The second '--' (if any) separates Primus entry args from Primus CLI arguments.
+    - If <entry> is anything other than 'container' or 'direct' (e.g. a primus
+      subcommand like 'preflight'), it is routed through the default container
+      chain unchanged.
 
 Options:
     --config FILE    Load configuration from specified file
@@ -32,8 +35,14 @@ Examples:
     # Launch with sbatch, log to file, run benchmark
     primus-cli slurm sbatch --output=run.log -N 2 -- container -- benchmark gemm -M 4096 -N 4096 -K 4096
 
-    # Run preflight environment check across 4 nodes
-    primus-cli slurm srun -N 4 -- preflight
+    # Run preflight environment check across 4 nodes (terse form: defaults to container entry)
+    primus-cli slurm srun -N 4 -- preflight --quick
+
+    # Run preflight via the direct entry (no container; uses host python or VENV_ACTIVATE)
+    primus-cli slurm srun -N 4 -- direct -- preflight --quick
+
+    # Run node smoke test via direct entry (auto-selects single mode for node_smoke)
+    primus-cli slurm srun -N 4 -- direct -- node_smoke --tier2-perf
 
     # Dry-run to see what would be executed
     primus-cli slurm --dry-run srun -N 4 -- container -- train
@@ -285,7 +294,37 @@ fi
 ENTRY="$RUNNER_DIR/primus-cli-slurm-entry.sh"
 require_file "$ENTRY" "[slurm] Entry script not found: $ENTRY"
 
-# Build full command
+# On the sbatch path the scheduler copies the batch script into its spool dir, so
+# the entry cannot locate its own lib/ from $0. Hand it the real runner directory
+# (propagated by sbatch --export=ALL, which is the default on both flavors).
+export PRIMUS_RUNNER_DIR="$RUNNER_DIR"
+
+# Build full command. Spur is detected by the presence of the `spur` command; its
+# srun needs an explicit task count -- see below.
+IS_SPUR=false
+command -v spur >/dev/null 2>&1 && IS_SPUR=true
+
+# Standard Slurm's srun derives one task per node from -N, while spur's srun
+# defaults to --ntasks=1: `srun -N 4 ENTRY` dispatches a single task, so only one
+# node runs the entry and the other ranks never start. Request one task per node
+# unless the caller already chose a task count. sbatch is unaffected (spur runs
+# the batch script on every allocated node regardless of --ntasks).
+if [[ "$IS_SPUR" == "true" && "$LAUNCH_CMD" == "srun" ]]; then
+    spur_nodes=""
+    spur_has_ntasks=false
+    for ((i = 0; i < ${#SLURM_FLAGS[@]}; i++)); do
+        case "${SLURM_FLAGS[i]}" in
+            -N|--nodes) spur_nodes="${SLURM_FLAGS[i + 1]:-}" ;;
+            --nodes=*) spur_nodes="${SLURM_FLAGS[i]#--nodes=}" ;;
+            -n|--ntasks|--ntasks=*) spur_has_ntasks=true ;;
+        esac
+    done
+    if [[ "$spur_has_ntasks" == "false" && "$spur_nodes" =~ ^[0-9]+$ ]]; then
+        SLURM_FLAGS+=(-n "$spur_nodes")
+        LOG_INFO "[slurm] Spur srun: requesting one task per node (-n $spur_nodes)"
+    fi
+fi
+
 CMD=("$LAUNCH_CMD" "${SLURM_FLAGS[@]}" "$ENTRY" "${ENTRY_ARGS[@]}" -- "$@")
 
 # Display command

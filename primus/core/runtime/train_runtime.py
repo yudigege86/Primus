@@ -1,5 +1,5 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc.
+# Copyright (c) 2026, Advanced Micro Devices, Inc.
 #
 # Primus Runtime Orchestrator for Training
 #
@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,14 +24,15 @@ from primus.core.config.primus_config import (
 )
 from primus.core.patches import run_patches
 from primus.core.runtime.logging import init_worker_logger
+from primus.core.runtime.runtime_state import RuntimeState
 from primus.core.utils.arg_utils import parse_cli_overrides
 from primus.core.utils.env_setup import setup_training_env
+from primus.core.utils.module_utils import log_dict_aligned, log_rank_0, warning_rank_0
 from primus.core.utils.yaml_utils import (
     dict_to_nested_namespace,
     merge_namespace,
     nested_namespace_to_dict,
 )
-from primus.modules.module_utils import log_dict_aligned, log_rank_0, warning_rank_0
 
 # ---------------------------------------------------------------------------
 # Context & Hooks
@@ -56,6 +58,7 @@ class TrainContext:
     trainer: Any = None
     backend_args: Any = None
     backend_version: Optional[str] = None
+    runtime_state: Optional[RuntimeState] = None
 
     # Distributed context
     rank: int = 0
@@ -96,6 +99,9 @@ class PrimusRuntime:
         try:
             # 1) Initialize configuration (PrimusConfig + module_config + CLI overrides)
             self._initialize_configuration(module_name, overrides)
+            # 1.5) Apply per-config environment overrides (top-level `env:`) before
+            #      any backend / distributed / JAX initialization consumes them.
+            self._apply_config_env()
             # 2) Initialize runtime environment (paths, distributed, logging)
             self._initialize_runtime_environment()
             # 3) Initialize backend and execute trainer lifecycle
@@ -113,6 +119,66 @@ class PrimusRuntime:
             # Best-effort cleanup; wrap into RuntimeError for caller.
             self._safe_cleanup(error=e)
             raise RuntimeError(f"Training execution failed: {e}") from e
+
+    def setup_model_only(
+        self,
+        module_name: str = "pre_trainer",
+        overrides: Optional[List[str]] = None,
+        primus_config: Any = None,
+    ) -> Any:
+        """Run the runtime pipeline but stop after building the model (no training).
+
+        A general, training-neutral entry that mirrors :meth:`run_train_module`
+        except it replaces the training step with a model-only build. Reuses the
+        full runtime initialization pipeline (config → environment → distributed →
+        logging → backend adapter → args conversion → build_args patches → trainer
+        setup/init → before_train patches) and then asks the trainer to build only
+        the model via ``setup_model_only``. Useful for any "build the model only"
+        scenario (offline profiling, layer benchmarking, model inspection);
+        performance/memory projection is the current consumer.
+
+        Args:
+            module_name: training module to build (default ``pre_trainer``).
+            overrides: CLI-style overrides to merge into the module params.
+            primus_config: optional pre-loaded (runtime-shaped) PrimusConfig. When
+                provided, config is not re-loaded from ``self.args.config`` — this
+                lets callers (e.g. projection) apply their own config mutations
+                before building.
+
+        Returns:
+            The trainer instance whose ``.model`` has been built.
+        """
+        overrides = overrides or []
+
+        # 1) Configuration (optionally injected, so callers can pre-mutate it)
+        self._initialize_configuration(module_name, overrides, primus_config=primus_config)
+        # 1.5) Apply per-config environment overrides (top-level `env:`).
+        self._apply_config_env()
+        # 2) Runtime environment (paths, distributed, logging)
+        self._initialize_runtime_environment()
+        # 3) Backend adapter + trainer (convert config, build_args patches, instantiate)
+        self._initialize_adapter()
+        self._initialize_trainer()
+
+        assert self.ctx is not None and self.ctx.trainer is not None
+        trainer = self.ctx.trainer
+
+        # 4) Setup + init + before_train patches (mirror _run_trainer_lifecycle up
+        #    to, but excluding, the training step).
+        self._run_phase_patches(phase="setup", backend_args=self.ctx.backend_args)
+        trainer.setup()
+        trainer.init()
+        self._run_phase_patches(phase="before_train", backend_args=self.ctx.backend_args)
+
+        # 5) Build only the model (no datasets / no train loop).
+        build_fn = getattr(trainer, "setup_model_only", None)
+        if build_fn is None:
+            raise NotImplementedError(
+                f"Trainer '{type(trainer).__name__}' for framework "
+                f"'{self.ctx.framework}' does not implement setup_model_only()."
+            )
+        build_fn()
+        return trainer
 
     # --------------------------- Internal Steps --------------------------- #
 
@@ -140,7 +206,9 @@ class PrimusRuntime:
             self.ctx.backend_version = None
         return self.ctx.backend_version
 
-    def _run_phase_patches(self, phase: str, backend_args: Any = None) -> None:
+    def _run_phase_patches(
+        self, phase: str, backend_args: Any = None, runtime_state: Optional[RuntimeState] = None
+    ) -> None:
         """
         Apply a patch phase in a single, runtime-owned place.
 
@@ -161,6 +229,7 @@ class PrimusRuntime:
                 "backend_args": backend_args,
                 "primus_config": self.ctx.primus_config,
                 "module_config": self.ctx.module_config,
+                "runtime_state": runtime_state,
             },
         )
 
@@ -173,11 +242,28 @@ class PrimusRuntime:
         # setup_training_env expects a string path.
         setup_training_env(str(data_path), setup_hf=True)
 
-    def _initialize_configuration(self, module_name: str, overrides: Optional[List[str]] = None) -> None:
-        cfg_path = Path(self.args.config)
-        assert cfg_path.exists(), f"[Primus:TrainRuntime] Config file not found: {cfg_path}"
+    def _initialize_configuration(
+        self,
+        module_name: str,
+        overrides: Optional[List[str]] = None,
+        primus_config: Any = None,
+    ) -> None:
+        # Resolve a config path for diagnostics/context (falls back to args.config
+        # when a pre-loaded config is injected and args may lack a usable path).
+        cfg_path = Path(getattr(self.args, "config", None) or getattr(primus_config, "config_file", "") or "")
+        if primus_config is not None:
+            # Caller supplied a pre-loaded (and possibly mutated) runtime config;
+            # skip re-loading from disk so those mutations are preserved.
+            primus_cfg = primus_config
+        else:
+            assert cfg_path.exists(), f"[Primus:TrainRuntime] Config file not found: {cfg_path}"
+            primus_cfg = load_primus_config(cfg_path, self.args)
 
-        primus_cfg = load_primus_config(cfg_path, self.args)
+        # Reuse the legacy PrimusConfig that load_primus_config already parsed
+        # (exposed as `_legacy`) instead of re-parsing the YAML a second time.
+        # BaseModule needs the PrimusConfig interface (get_module_config / global
+        # vars); the SimpleNamespace `primus_cfg` drives the new core runtime.
+        primus_config_obj = primus_cfg._legacy
 
         # Resolve module configuration via core helper.
         module_cfg = get_module_config(primus_cfg, module_name)
@@ -193,11 +279,15 @@ class PrimusRuntime:
             raise ValueError(f"[Primus:TrainRuntime] Module '{module_name}' missing 'framework'.")
 
         # Initialize TrainContext based on raw configuration (before CLI overrides).
+        # Use primus_config_obj (PrimusConfig) for BaseModule compatibility
+        _data_path = getattr(self.args, "data_path", None)
+        if not _data_path:
+            _data_path = "./data"
         self.ctx = TrainContext(
             config_path=cfg_path,
-            data_path=Path(getattr(self.args, "data_path", "./data")),
+            data_path=Path(_data_path),
             module_name=module_name,
-            primus_config=primus_cfg,
+            primus_config=primus_config_obj,  # Use PrimusConfig object, not SimpleNamespace
             module_config=module_cfg,
             framework=framework,
         )
@@ -218,6 +308,59 @@ class PrimusRuntime:
         base_params_dict = nested_namespace_to_dict(module_cfg.params)
         merged_params_dict = deep_merge(base_params_dict, override_dict)
         module_cfg.params = dict_to_nested_namespace(merged_params_dict)
+
+    def _apply_config_env(self) -> None:
+        """Apply a top-level ``env:`` mapping from the experiment YAML into ``os.environ``.
+
+        This is the single, launcher-agnostic hook for per-config environment
+        overrides (e.g. ``XLA_FLAGS``, ``XLA_PYTHON_CLIENT_MEM_FRACTION``,
+        ``RCCL_WARP_SPEED_AUTO``). It runs after configuration is loaded but
+        BEFORE the runtime environment, distributed init, backend adapter, or any
+        ``import jax`` — so exported flags take effect for JAX/XLA and RCCL.
+
+        The block lives at the top level of the YAML (a sibling of ``modules:``),
+        NOT inside a module, so it is never swept into ``module_config.params``
+        and therefore never forwarded to the backend (MaxText/Megatron) args:
+
+            env:
+              XLA_PYTHON_CLIENT_MEM_FRACTION: "0.96"
+              RCCL_WARP_SPEED_AUTO: "0"
+
+        Semantics:
+          - Values are stringified and ``os.environ[k] = str(v)`` unconditionally,
+            so a per-config ``env:`` WINS over values baked into the image.
+          - ``$VAR`` / ``${VAR}`` references are expanded via ``os.path.expandvars``
+            (bash ``${VAR:-default}`` syntax is NOT expanded).
+          - Best-effort: a malformed or missing ``env:`` never aborts the run.
+        """
+        cfg_path = getattr(self.ctx, "config_path", None) if self.ctx is not None else None
+        if not cfg_path:
+            return
+        try:
+            import yaml
+
+            cfg_path = Path(cfg_path)
+            if not cfg_path.exists():
+                return
+            with open(cfg_path) as f:
+                raw = yaml.safe_load(f) or {}
+            env_block = raw.get("env") if isinstance(raw, dict) else None
+            if not env_block:
+                return
+            if not isinstance(env_block, dict):
+                # NOTE: logger is not initialized yet at this stage (see
+                # _initialize_runtime_environment), so use print() like _apply_overrides.
+                print(
+                    f"[Primus:Runtime] Ignoring non-mapping top-level `env:` in {cfg_path.name} "
+                    f"(type={type(env_block).__name__})"
+                )
+                return
+            for key, value in env_block.items():
+                resolved = os.path.expandvars(str(value))
+                os.environ[str(key)] = resolved
+                print(f"[Primus:Runtime] env override: {key}={resolved}")
+        except Exception as exc:  # noqa: BLE001 - env overrides must never abort a run
+            print(f"[Primus:Runtime] WARNING: could not apply top-level `env:` from config: {exc}")
 
     def _initialize_distributed_context(self) -> None:
         assert self.ctx is not None, "TrainContext must be initialized before distributed init."
@@ -278,8 +421,14 @@ class PrimusRuntime:
         backend_args = adapter.convert_config(module_config.params)
         self.ctx.backend_args = backend_args
 
+        # Create runtime state object (for dynamic per-iteration metrics)
+        # Initialize early so it's available for all patch phases
+        self.ctx.runtime_state = RuntimeState()
+
         # Phase: build_args (after args creation, before trainer instantiation)
-        self._run_phase_patches(phase="build_args", backend_args=backend_args)
+        self._run_phase_patches(
+            phase="build_args", backend_args=backend_args, runtime_state=self.ctx.runtime_state
+        )
 
         # Log final args after patches, then merge module_config.params into backend_args
         log_dict_aligned("Final backend args (after patches)", backend_args)
@@ -295,17 +444,63 @@ class PrimusRuntime:
             primus_only_params = {key: params_dict[key] for key in sorted(primus_only_keys)}
             log_dict_aligned("Primus-specific parameters", primus_only_params)
 
+        # Extract trainer_class from module_config BEFORE merging params into backend_args
+        # (After merge, module_config.params becomes backend_args, and trainer_class might be lost)
+        trainer_class = None
+
+        # First, check module_config directly (top-level attribute)
+        if hasattr(module_config, "trainer_class"):
+            trainer_class = module_config.trainer_class
+        # Second, check module_config.params (nested in params, BEFORE merge)
+        elif hasattr(module_config.params, "trainer_class"):
+            trainer_class = module_config.params.trainer_class
+
         # Merge backend_args into params (backend_args overrides params)
         merge_namespace(backend_args, module_config.params, allow_override=False, excepts=[])
         module_config.params = backend_args
 
-        # Load trainer class and instantiate
+        # Third, check backend_args (after merge, in case it was preserved)
+        if not trainer_class and hasattr(backend_args, "trainer_class"):
+            trainer_class = backend_args.trainer_class
+
+        # Log summary of trainer_class extraction (keep one summary log for troubleshooting)
+        if trainer_class:
+            log_rank_0(f"[TrainRuntime] Using trainer_class: {trainer_class}")
+        else:
+            log_rank_0(f"[TrainRuntime] WARNING: trainer_class not found, will use default for stage")
+
+        # Extract stage for fallback
         stage = getattr(module_config.params, "stage", "pretrain") or "pretrain"
-        TrainerClass = adapter.load_trainer_class(stage=stage)
-        trainer = TrainerClass(backend_args=backend_args)
+
+        log_rank_0(f"[TrainRuntime] Loading trainer: stage={stage}, trainer_class={trainer_class}")
+        # Only forward trainer_class to adapters that support it (Megatron). Other
+        # backend adapters keep their stage-only signature, so passing trainer_class
+        # unconditionally would raise TypeError on the shared core-runtime path.
+        trainer_cls = adapter.load_trainer_class(
+            stage=stage,
+            **({"trainer_class": trainer_class} if trainer_class else {}),
+        )
+        log_rank_0(f"[TrainRuntime] Loaded trainer class: {trainer_cls.__name__}")
+
+        # Initialize trainer with both BaseModule and BaseTrainer arguments
+        # BaseModule needs: module_name, primus_config, module_rank, module_world_size, module_master_addr, module_master_port
+        # BaseTrainer needs: backend_args
+        # Note: BaseModule.__init__ expects keyword arguments, not positional
+        trainer = trainer_cls(
+            backend_args=backend_args,
+            module_name=self.ctx.module_name,
+            primus_config=self.ctx.primus_config,
+            module_rank=self.ctx.rank,
+            module_world_size=self.ctx.world_size,
+            module_master_addr=self.ctx.master_addr,
+            module_master_port=self.ctx.master_port,
+        )
 
         assert trainer is not None, f"Failed to create trainer instance for framework '{self.ctx.framework}'."
         self.ctx.trainer = trainer
+
+        # Attach runtime_state to trainer instance for easy access in forward_step()
+        trainer.runtime_state = self.ctx.runtime_state
 
     def _run_trainer_lifecycle(self) -> None:
         assert (
@@ -325,18 +520,32 @@ class PrimusRuntime:
         trainer = self.ctx.trainer
 
         # 1) Optional setup phase
-        self._run_phase_patches(phase="setup", backend_args=self.ctx.backend_args)
+        self._run_phase_patches(
+            phase="setup", backend_args=self.ctx.backend_args, runtime_state=self.ctx.runtime_state
+        )
         _log_step("Setup", trainer.setup)
 
         # 2) Initialize training components
         _log_step("Init", trainer.init)
 
         # 3) Execute training
-        self._run_phase_patches(phase="before_train", backend_args=self.ctx.backend_args)
-        _log_step("Training", trainer.train)
+        self._run_phase_patches(
+            phase="before_train", backend_args=self.ctx.backend_args, runtime_state=self.ctx.runtime_state
+        )
+        import gc
+
+        gc.disable()
+        log_rank_0("Python GC disabled for training (matching NeMo memory management)")
+        try:
+            _log_step("Training", trainer.train)
+        finally:
+            gc.enable()
+            log_rank_0("Python GC re-enabled after training")
 
         # 4) Cleanup and finalize
-        self._run_phase_patches(phase="after_train", backend_args=self.ctx.backend_args)
+        self._run_phase_patches(
+            phase="after_train", backend_args=self.ctx.backend_args, runtime_state=self.ctx.runtime_state
+        )
         _log_step("Cleanup", trainer.cleanup)
 
     # --------------------------- Cleanup ---------------------------------- #

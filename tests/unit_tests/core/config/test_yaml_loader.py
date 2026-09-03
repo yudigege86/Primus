@@ -49,6 +49,24 @@ class TestYamlLoader:
         assert result["child_val"] == 3
         assert "extends" not in result  # Should be removed
 
+    def test_parse_yaml_scalar_extends(self, tmp_path):
+        """A lone preset written as a scalar must not be iterated per character."""
+        base = tmp_path / "base.yaml"
+        base.write_text("base_val: 1\noverride_val: 1")
+
+        child = tmp_path / "child.yaml"
+        child.write_text(
+            """
+        extends: base.yaml
+        override_val: 2
+        """
+        )
+
+        result = parse_yaml(str(child))
+        assert result["base_val"] == 1
+        assert result["override_val"] == 2
+        assert "extends" not in result
+
     def test_parse_yaml_multi_extends(self, tmp_path):
         """Test extending multiple files."""
         base1 = tmp_path / "base1.yaml"
@@ -110,3 +128,34 @@ class TestYamlLoader:
         assert _resolve_env_in_string("${NUM}") == 42
         assert _resolve_env_in_string("${FLOAT}") == 3.14
         assert _resolve_env_in_string("prefix_${NUM}") == "prefix_42"
+
+    def test_env_resolution_bool_strings(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FLAG_TRUE", "true")
+        monkeypatch.setenv("FLAG_FALSE", "false")
+        monkeypatch.setenv("FLAG_UPPER", "False")
+        monkeypatch.delenv("UNSET_BOOL", raising=False)
+
+        assert _resolve_env_in_string("${FLAG_TRUE}") is True
+        assert _resolve_env_in_string("${FLAG_FALSE}") is False
+        assert _resolve_env_in_string("${FLAG_UPPER}") is False
+        assert _resolve_env_in_string("${UNSET_BOOL:false}") is False
+        assert _resolve_env_in_string("${UNSET_BOOL:true}") is True
+
+        content = """
+        native_false: false
+        env_false_default: ${UNSET_BOOL:false}
+        env_false_set: ${FLAG_FALSE}
+        env_true_set: ${FLAG_TRUE}
+        env_zero: ${UNSET_ZERO:0}
+        """
+        monkeypatch.delenv("UNSET_ZERO", raising=False)
+        cfg_file = tmp_path / "bool_env.yaml"
+        cfg_file.write_text(content)
+
+        result = parse_yaml(str(cfg_file))
+        assert result["native_false"] is False
+        assert result["env_false_default"] is False
+        assert result["env_false_set"] is False
+        assert result["env_true_set"] is True
+        assert result["env_zero"] == 0
+        assert isinstance(result["env_zero"], int)

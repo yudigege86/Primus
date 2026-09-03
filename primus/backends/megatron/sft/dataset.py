@@ -99,6 +99,7 @@ def build_train_valid_test_datasets(
     seed: int = 1234,
     enable_packed_sequences: bool = False,
     bridge_compat_inline_bos: bool = False,
+    segment_align: int = 1,
     **kwargs,
 ) -> Tuple[Optional[Dataset], Optional[Dataset], Optional[Dataset]]:
     """Build train/validation/test datasets using Megatron-local SFT helpers.
@@ -113,6 +114,15 @@ def build_train_valid_test_datasets(
     EOS). It is forwarded to ``PackedSFTDataset`` / ``SFTDataset`` so it
     does not accidentally leak into HuggingFace ``load_dataset(**kwargs)``.
 
+    ``segment_align`` rounds every packed segment up to a multiple of itself
+    (DeepSeek-V4's compressed branches under context parallelism need it set
+    to the largest ``compress_ratio``). It is named here for the same reason
+    as ``bridge_compat_inline_bos``: only ``PackedSFTDataset`` accepts it, so
+    left in ``**kwargs`` it would reach ``SFTDataset`` on the unpacked path
+    and from there ``load_dataset(dataset_name, split=split, **kwargs)``,
+    which rejects unknown builder-config keys. It is therefore forwarded
+    only when packing is on.
+
     Special-case dispatch -- mlperf packed npy directory
     ----------------------------------------------------
     If ``dataset_name`` points to a directory containing the mlperf-style
@@ -121,9 +131,10 @@ def build_train_valid_test_datasets(
     HF / jsonl tokenize+pack pipeline and route to
     ``MlperfPackedDataset``. This lets a Native SFT run consume the exact
     byte-identical packs produced by the upstream mlperf
-    ``download_dataset.py + convert_dataset.py + create_metadata.py``
-    pipeline (used by ``examples/megatron_bridge/configs/MI355X/
-    llama2_70b_lora_posttrain.yaml``).
+    ``primus.backends.megatron_bridge.recipes.mlperf_llama2_70b`` dataset utilities
+    (``download_dataset.py + convert_dataset.py + create_metadata.py``)
+    pipeline (used by ``examples/mlperf/llama2_70b/configs/MI355X/
+    ``llama2_70b_lora_mlperf_posttrain.yaml``).
     """
     from primus.backends.megatron.sft.mlperf_packed_dataset import (
         build_mlperf_packed_datasets,
@@ -149,8 +160,12 @@ def build_train_valid_test_datasets(
         from primus.backends.megatron.sft.packing import PackedSFTDataset
 
         DatasetCls = PackedSFTDataset
+        # Packing-only knob. SFTDataset has no such parameter, so on the
+        # unpacked path it would fall through to load_dataset() and raise.
+        packed_only = {"segment_align": segment_align}
     else:
         DatasetCls = SFTDataset
+        packed_only = {}
 
     train_ds = None
     valid_ds = None
@@ -165,6 +180,7 @@ def build_train_valid_test_datasets(
             formatter=formatter,
             seed=seed,
             bridge_compat_inline_bos=bridge_compat_inline_bos,
+            **packed_only,
             **kwargs,
         )
 
@@ -178,6 +194,7 @@ def build_train_valid_test_datasets(
                 formatter=formatter,
                 seed=seed,
                 bridge_compat_inline_bos=bridge_compat_inline_bos,
+                **packed_only,
                 **kwargs,
             )
         except (ValueError, KeyError) as exc:
@@ -194,6 +211,7 @@ def build_train_valid_test_datasets(
                 formatter=formatter,
                 seed=seed,
                 bridge_compat_inline_bos=bridge_compat_inline_bos,
+                **packed_only,
                 **kwargs,
             )
         except (ValueError, KeyError) as exc:

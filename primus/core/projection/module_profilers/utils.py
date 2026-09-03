@@ -34,6 +34,30 @@ def _bench_iter_count(default_warmup: int, default_iters: int) -> Tuple[int, int
     return max(1, warmup), max(1, iters)
 
 
+def _bench_insitu_depth() -> int:
+    """In-situ measurement depth (``PRIMUS_BENCH_INSITU_DEPTH``, default 1).
+
+    The default per-layer bench times a *single* layer in isolation: warm,
+    dedicated caches and only that one layer's activations resident.  The real
+    training step keeps **all** layers' activations resident for backward and
+    runs ~10k kernels back-to-back, so HBM bandwidth and the caching allocator
+    are under pressure and the same kernels run materially slower (silicon
+    evidence: isolated attention-bwd microbench ~2x faster than in-situ EP8).
+
+    Setting depth ``K>1`` chains the representative layer ``K`` times in one
+    forward (output -> next input) and backprops once through the whole stack,
+    so ``K`` sets of activations stay resident; the reported per-layer time is
+    ``total / K``.  This captures the resident-working-set / HBM pressure *by
+    measurement* rather than by a calibration constant.  ``K=1`` is the
+    original behaviour and is the default, so nothing changes unless opted in.
+    """
+    try:
+        depth = int(os.environ.get("PRIMUS_BENCH_INSITU_DEPTH", "1"))
+    except ValueError:
+        depth = 1
+    return max(1, depth)
+
+
 def _bench_central_value(times: list[float]) -> float:
     """Compute the per-iteration central value used by the bench reporters.
 
@@ -97,11 +121,53 @@ def _get_fp8_context_for_benchmark(transformer_config):
     return _FP8ContextFactory(transformer_config)
 
 
+def v4_module_inputs(module, batch_size, seq_len, hidden_size, hc_mult, kind):
+    """Build DeepSeek-V4-aware benchmark inputs, or None for non-V4 modules.
+
+    The generic harness feeds stock-attention inputs ``(hidden[S,B,D],
+    bool attention_mask)``, but the V4 modules have different signatures:
+
+    * ``DeepseekV4Attention.forward(hidden[B,S,D], position_ids[B,S])`` —
+      both positional; needs integer position_ids (not a bool mask).
+    * ``DeepseekV4HybridLayer.forward(hidden[B,S,K,D], attention_mask=None,
+      *, position_ids[B,S])`` — K=hc_mult parallel mHC streams, and
+      position_ids is keyword-only.
+
+    Returns ``(input_shapes, forward_kwargs)`` or ``None``.
+    """
+    cls = type(module).__name__
+    if kind == "attention" and "DeepseekV4Attention" in cls:
+        return (
+            [(batch_size, seq_len, hidden_size), ((batch_size, seq_len), torch.int64)],
+            None,
+        )
+    if kind == "layer" and "DeepseekV4HybridLayer" in cls:
+        k = max(1, int(hc_mult or 1))
+        ishapes = [(batch_size, seq_len, k, hidden_size)] if k > 1 else [(batch_size, seq_len, hidden_size)]
+        # position_ids for RoPE; token_ids required by hash-routed MoE layers
+        # (ignored by non-hash layers). Both keyword-only on the V4 layer forward.
+        return (
+            ishapes,
+            {
+                "position_ids": ((batch_size, seq_len), torch.int64),
+                "token_ids": ((batch_size, seq_len), torch.int64),
+            },
+        )
+    if kind == "moe" and "DeepseekV4MoE" in cls:
+        # forward(hidden[B,S,D], *, token_ids[B,S]) -> [B,S,D]
+        return (
+            [(batch_size, seq_len, hidden_size)],
+            {"token_ids": ((batch_size, seq_len), torch.int64)},
+        )
+    return None
+
+
 def benchmark_layer(
     layer_module: torch.nn.Module,
     input_shapes: List[Union[Tuple[int, ...], Tuple[Tuple[int, ...], torch.dtype]]],
     num_iterations: int = 64,  # Match typical microbatch count
     transformer_config=None,  # Optional: pass config to enable FP8 context
+    forward_kwargs=None,  # Optional: dict name -> shape/(shape,dtype) passed as keywords
 ) -> tuple[float, float, int]:
     """
     Benchmark both forward and backward passes of a transformer layer using CUDA events.
@@ -152,11 +218,41 @@ def benchmark_layer(
             )
 
     inputs = [create_input(spec) for spec in input_shapes]
+    kwargs = {name: create_input(spec) for name, spec in (forward_kwargs or {}).items()}
 
     # ===========================================================================
     # Get FP8 context - CRITICAL for accurate FP8 timing!
     # ===========================================================================
     fp8_context = _get_fp8_context_for_benchmark(transformer_config)
+
+    # ===========================================================================
+    # In-situ depth: optionally chain the layer K times so K activation sets are
+    # resident (captures HBM / allocator pressure by measurement; see
+    # _bench_insitu_depth).  ``_run_fwd`` feeds output[0] back as input[0] each
+    # hop and returns the final output tuple; reported time is later divided by
+    # the *effective* depth.  Depth is downgraded to 1 if the layer's first
+    # output shape does not match its first input (chaining would be invalid).
+    # ===========================================================================
+    insitu_depth = [_bench_insitu_depth()]
+
+    def _run_fwd():
+        cur = list(inputs)
+        out = None
+        for hop in range(insitu_depth[0]):
+            out = layer_module(*cur, **kwargs)
+            out_t = out if isinstance(out, (tuple, list)) else (out,)
+            if insitu_depth[0] > 1:
+                first = out_t[0]
+                if (
+                    not isinstance(first, torch.Tensor)
+                    or not isinstance(inputs[0], torch.Tensor)
+                    or first.shape != inputs[0].shape
+                ):
+                    if hop == 0:
+                        insitu_depth[0] = 1  # not chainable; fall back silently
+                    break
+                cur[0] = first  # feed hidden states forward to keep activations live
+        return out
 
     # ===========================================================================
     # WARMUP (20 iterations) - fully warm GPU caches, JIT, and allocators
@@ -168,7 +264,7 @@ def benchmark_layer(
 
     with fp8_context:
         for _ in range(num_warmup):
-            outputs = layer_module(*inputs)
+            outputs = _run_fwd()
             if not isinstance(outputs, (tuple, list)):
                 outputs = (outputs,)
 
@@ -213,12 +309,14 @@ def benchmark_layer(
 
     with fp8_context:
         for _ in range(num_iterations):
-            outputs = layer_module(*inputs)
+            outputs = _run_fwd()
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     mem_after_forward = torch.cuda.max_memory_allocated(device)
-    activation_memory = (mem_after_forward - mem_before) // num_iterations
+    # ``_run_fwd`` holds ``insitu_depth`` activation sets resident; normalise
+    # back to a single layer's activation footprint.
+    activation_memory = (mem_after_forward - mem_before) // (num_iterations * insitu_depth[0])
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
@@ -237,7 +335,7 @@ def benchmark_layer(
             forward_end = torch.cuda.Event(enable_timing=True)
 
             forward_start.record()
-            outputs = layer_module(*inputs)
+            outputs = _run_fwd()
             forward_end.record()
 
             # --- Backward pass ---
@@ -263,8 +361,10 @@ def benchmark_layer(
                 if inp.requires_grad:
                     inp.grad = None
 
-    avg_forward_time = _bench_central_value(forward_times)
-    avg_backward_time = _bench_central_value(backward_times)
+    # Per-layer time = measured stacked time / effective in-situ depth.
+    depth = insitu_depth[0]
+    avg_forward_time = _bench_central_value(forward_times) / depth
+    avg_backward_time = _bench_central_value(backward_times) / depth
 
     return avg_forward_time, avg_backward_time, int(activation_memory)
 
@@ -391,6 +491,7 @@ def benchmark_moe_layer_decomposed(
     input_shapes: List[Union[Tuple[int, ...], Tuple[Tuple[int, ...], torch.dtype]]],
     num_iterations: int = 64,
     transformer_config=None,
+    forward_kwargs=None,  # Optional: dict name -> shape/(shape,dtype) passed as keywords
 ) -> tuple[float, float, int, float, float]:
     """
     Benchmark an MoE layer with decomposed A2A timing.
@@ -453,47 +554,92 @@ def benchmark_moe_layer_decomposed(
             )
 
     inputs = [create_input(spec) for spec in input_shapes]
+    kwargs = {name: create_input(spec) for name, spec in (forward_kwargs or {}).items()}
     fp8_context = _get_fp8_context_for_benchmark(transformer_config)
 
     is_rank_0 = int(os.getenv("RANK", "0")) == 0
 
-    # Install kernel-shape-padding (balanced round-robin routing) so the
-    # per-expert M dimension is constant across iterations.  This eliminates
-    # per-shape JIT recompiles in the FP8 grouped GEMM and is the dominant
-    # cost on high-expert MoE benches.
-    routing_restores = []
-    if _kernel_pad_enabled():
-        routing_restores, routing_descriptors = _install_balanced_routing_patches(moe_module)
-        if routing_descriptors and is_rank_0:
-            _, topk, num_experts = routing_descriptors[0]
-            # The bench feeds a single [seq_len, batch_size, hidden] input,
-            # so the per-rank token count is the product of the first two
-            # dims (TP/SP sharding is already reflected in the supplied
-            # shape).
-            num_tokens = 1
-            for spec in input_shapes:
-                shape = (
-                    spec[0]
-                    if isinstance(spec, tuple) and len(spec) == 2 and isinstance(spec[1], torch.dtype)
-                    else spec
-                )
-                # [seq, batch, hidden]
-                if len(shape) >= 2:
-                    num_tokens = int(shape[0]) * int(shape[1])
-                break
-            m_per_expert = (num_tokens * topk) // max(num_experts, 1)
-            print(
-                f"  [MoE Decomposed] Kernel-shape padding ON: balanced "
-                f"round-robin routing on {len(routing_descriptors)} router(s) "
-                f"(topk={topk}, num_experts={num_experts}, "
-                f"M_per_expert={m_per_expert}). "
-                f"Set PRIMUS_BENCH_MOE_KERNEL_PAD=0 to disable."
-            )
-        elif is_rank_0:
-            print(
-                "  [MoE Decomposed] Kernel-shape padding requested but no "
-                "router-like submodule found; falling back to stochastic routing."
-            )
+    with fp8_context:
+        for _ in range(num_warmup):
+            outputs = moe_module(*inputs, **kwargs)
+            if not isinstance(outputs, (tuple, list)):
+                outputs = (outputs,)
+
+            if grad_outputs is None:
+                grad_outputs = []
+                for i, out in enumerate(outputs):
+                    if isinstance(out, torch.Tensor) and out.requires_grad:
+                        grad_outputs.append(torch.randn_like(out))
+                        output_indices.append(i)
+
+            valid_outputs = [outputs[i] for i in output_indices]
+            if valid_outputs:
+                torch.autograd.backward(valid_outputs, grad_outputs)
+
+            moe_module.zero_grad(set_to_none=True)
+            for inp in inputs:
+                if inp.requires_grad:
+                    inp.grad = None
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    # --- Measure activation memory (forward-only loop) ---
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    mem_before = torch.cuda.memory_allocated(device)
+
+    with fp8_context:
+        for _ in range(num_iterations):
+            outputs = moe_module(*inputs, **kwargs)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    mem_after_forward = torch.cuda.max_memory_allocated(device)
+    activation_memory = (mem_after_forward - mem_before) // num_iterations
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    del outputs
+
+    # =========================================================================
+    # BENCHMARK with decomposed A2A timing
+    # =========================================================================
+    # Monkey-patch dispatch() and combine() to insert CUDA events.
+    # MoELayer.forward() calls self.dispatch(...) and self.combine(...)
+    # so instance-attribute patches are picked up by Python's MRO.
+    original_dispatch = moe_module.dispatch
+    original_combine = moe_module.combine
+
+    # Accumulate (start_event, end_event) pairs per iteration
+    _dispatch_events = []  # one (start, end) per iteration
+    _combine_events = []
+
+    def timed_dispatch(*args, **kwargs):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = original_dispatch(*args, **kwargs)
+        end.record()
+        _dispatch_events.append((start, end))
+        return result
+
+    def timed_combine(*args, **kwargs):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = original_combine(*args, **kwargs)
+        end.record()
+        _combine_events.append((start, end))
+        return result
+
+    moe_module.dispatch = timed_dispatch
+    moe_module.combine = timed_combine
+
+    forward_times = []
+    backward_times = []
 
     try:
         # =====================================================================
@@ -504,8 +650,19 @@ def benchmark_moe_layer_decomposed(
         num_warmup, num_iterations = _bench_iter_count(20, num_iterations)
 
         with fp8_context:
-            for _ in range(num_warmup):
-                outputs = moe_module(*inputs)
+            for _ in range(num_iterations):
+                # --- Forward pass ---
+                forward_start = torch.cuda.Event(enable_timing=True)
+                forward_end = torch.cuda.Event(enable_timing=True)
+
+                forward_start.record()
+                outputs = moe_module(*inputs, **kwargs)
+                forward_end.record()
+
+                # --- Backward pass ---
+                backward_start = torch.cuda.Event(enable_timing=True)
+                backward_end = torch.cuda.Event(enable_timing=True)
+
                 if not isinstance(outputs, (tuple, list)):
                     outputs = (outputs,)
 

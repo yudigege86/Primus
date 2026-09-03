@@ -6,10 +6,35 @@ dist/
 *.egg-info
 *~
 logs
+.pip_cache
 .vscode
 local/
 .gitmodules
 output
 experiment
-data
+/data/*
+!primus/backends/diffusion/data/
+!primus/backends/diffusion/data/**
+primus/backends/diffusion/data/**/__pycache__/
+primus/backends/diffusion/data/**/*.pyc
 pp_simulation_result
+
+# Allow the projection site's breakdown JSON (consumed by the static site /
+# GitHub Pages) despite the generic `data` ignore above.
+!examples/deepseek-v4/projection/site/data/
+!examples/deepseek-v4/projection/site/data/*.json
+
+*.log
+*.nohup
+*.zip
+
+# Local run artifacts dropped at the repo root. These capture node FQDNs and
+# absolute paths from whichever cluster the run happened on, so keep them out
+# of the history.
+/log
+/log.*
+/nohup.*
+/core.*.gpu
+.triton_cache_shared/
+.jax_cache/
+.cursor/

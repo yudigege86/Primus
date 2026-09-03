@@ -5,6 +5,7 @@
 ###############################################################################
 
 import warnings
+from types import SimpleNamespace
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine import (
@@ -21,6 +22,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
@@ -41,6 +43,7 @@ try:
         PrimusTurboLinear,
         PrimusTurboRowParallelGroupedLinear,
         PrimusTurboRowParallelLinear,
+        _make_primus_turbo_norm_te_column_parallel_linear,
     )
 except (ImportError, ModuleNotFoundError):
     PrimusTurboAttention = None
@@ -50,6 +53,7 @@ except (ImportError, ModuleNotFoundError):
     PrimusTurboLinear = None
     PrimusTurboRowParallelGroupedLinear = None
     PrimusTurboRowParallelLinear = None
+    _make_primus_turbo_norm_te_column_parallel_linear = None
 
 _LEGACY_GROUPED_MLP_CLS = None
 
@@ -101,11 +105,27 @@ def _build_legacy_grouped_mlp_class():
     return PrimusLegacyGroupedMLP
 
 
+def _build_default_primus_args() -> SimpleNamespace:
+    """Fallback args for environments without initialized Primus globals."""
+    return SimpleNamespace(
+        enable_primus_turbo=False,
+        use_turbo_gemm=False,
+        use_turbo_norm_te_linear=False,
+        use_turbo_attention=False,
+        use_turbo_grouped_gemm=False,
+        moe_use_legacy_grouped_gemm=False,
+    )
+
+
 class PrimusTurboSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def __init__(self):
-        self.cfg = get_primus_args()
+    def __init__(self, fallback_to_eager_attn: bool = False):
+        try:
+            self.cfg = get_primus_args()
+        except AssertionError:
+            self.cfg = _build_default_primus_args()
+        self.fallback_to_eager_attn = fallback_to_eager_attn
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -131,19 +151,65 @@ class PrimusTurboSpecProvider(BackendSpecProvider):
             else TERowParallelLinear
         )
 
+    def column_parallel_linear_with_gather_output(self) -> type:
+        """Non-TE column-parallel linear that supports ``gather_output=True``.
+
+        TE / Turbo column-parallel wrappers explicitly raise
+        ``ValueError("Transformer Engine linear layers do not support
+        gather_output = True")`` (see
+        ``third_party/Megatron-LM/megatron/core/extensions/transformer_engine.py:747``
+        and ``:972``).  Callers that need a column-parallel layer
+        whose output dim is gathered back to full width across TP
+        ranks (so downstream math stays TP-agnostic) must use the
+        upstream Megatron-native :class:`ColumnParallelLinear`.
+
+        Plan-3 P21: V4's ``linear_q_up_proj`` is the canonical
+        consumer — it shards ``q_lora_rank -> n_heads * head_dim``
+        across TP and gathers the heads at forward time.
+        """
+        return ColumnParallelLinear
+
+    def row_parallel_linear_with_scatter_input(self) -> type:
+        """Non-TE row-parallel linear that supports ``input_is_parallel=False``.
+
+        TE / Turbo row-parallel wrappers explicitly raise
+        ``ValueError("Transformer Engine linear layers do not support
+        input_is_parallel = False")`` (see
+        ``third_party/Megatron-LM/megatron/core/extensions/transformer_engine.py:1081``).
+        Callers that hand the layer a full-width (non-sharded) input
+        and want it scattered internally + the output all-reduced
+        must use the upstream Megatron-native :class:`RowParallelLinear`.
+
+        Plan-3 P21: V4's grouped-O ``linear_o_b`` is the canonical
+        consumer — after the inner ``[..., n_per_group, o_lora_rank]
+        -> [..., o_groups * o_lora_rank]`` reshape, the input is
+        full-width across TP and the row-parallel layer's
+        weight-sharding + reduce is what produces the correct sum.
+        """
+        return RowParallelLinear
+
     def fuse_layernorm_and_linear(self) -> bool:
         """TE backend chooses a single module for layernorm and linear"""
         return True
 
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
-        """Which module for sequential layernorm and linear"""
-        return (
-            _require_primus_turbo(
+        """Which module for sequential layernorm and linear.
+
+        Three choices, because the norm and the GEMM want different backends on
+        these shapes: Turbo's rmsnorm beats TE's, while TE's hipBLASLt GEMM beats
+        Turbo's. ``use_turbo_norm_te_linear`` takes only the norm.
+        """
+        if self.cfg.use_turbo_gemm:
+            return _require_primus_turbo(
                 PrimusTurboLayerNormColumnParallelLinear, "layernorm column parallel linear"
             )
-            if self.cfg.use_turbo_gemm
-            else TELayerNormColumnParallelLinear
-        )
+        if getattr(self.cfg, "use_turbo_norm_te_linear", False):
+            factory = _require_primus_turbo(
+                _make_primus_turbo_norm_te_column_parallel_linear,
+                "turbo-norm layernorm column parallel linear",
+            )
+            return factory()
+        return TELayerNormColumnParallelLinear
 
     def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
         """Which module to use for layer norm"""
@@ -156,6 +222,8 @@ class PrimusTurboSpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
+        if self.fallback_to_eager_attn:
+            return DotProductAttention
         return (
             _require_primus_turbo(PrimusTurboAttention, "attention")
             if self.cfg.use_turbo_attention
@@ -170,8 +238,7 @@ class PrimusTurboSpecProvider(BackendSpecProvider):
             # Megatron callers only pass ``moe_use_grouped_gemm`` here, so when Primus
             # args do not expose the legacy switch we must match upstream TESpecProvider
             # and prefer TEGroupedMLP by default.
-            # let it raise an error if cfg does not have moe_use_legacy_grouped_gemm
-            moe_use_legacy_grouped_gemm = self.cfg.moe_use_legacy_grouped_gemm
+            moe_use_legacy_grouped_gemm = getattr(self.cfg, "moe_use_legacy_grouped_gemm", False)
 
         use_turbo_grouped_gemm = self.cfg.use_turbo_grouped_gemm
         assert not (
@@ -220,3 +287,244 @@ class PrimusTurboSpecProvider(BackendSpecProvider):
     def activation_func(self) -> type:
         """Which module to use for activation function"""
         return TEActivationOp
+
+
+class DeepSeekV4SpecProvider(PrimusTurboSpecProvider):
+    """DeepSeek-V4 provider rooted on PrimusTurboSpecProvider."""
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
+
+    def v4_norm_module(self):
+        """Norm module used by V4 specs (block / layer / final)."""
+        return self.layer_norm(rms_norm=True)
+
+    def v4_q_layernorm(self) -> type:
+        """Norm module for V4's `q_norm` (RMSNorm on `q_lora_rank`).
+
+        Same as MLA's `q_layernorm`; we use the for_qk path so the TE
+        version selection picks Apex / FusedLayerNorm on older TE.
+        """
+        return self.layer_norm(rms_norm=True, for_qk=True)
+
+    def v4_kv_layernorm(self) -> type:
+        """Norm module for V4's `kv_norm` (RMSNorm on `head_dim`).
+
+        Single-latent KV: V4 normalizes the `wkv` output (one shared head)
+        BEFORE broadcasting to all query heads.
+        """
+        return self.layer_norm(rms_norm=True, for_qk=True)
+
+    def v4_mlp_activation_func(self) -> Optional[type]:
+        """Activation-func selection for V4 MLP / shared-expert specs.
+
+        Plan-2 P18 (D2 audit): the parent ``activation_func()`` returns
+        the TE module **type** (``TEActivationOp``); but Megatron's
+        ``MLP.__init__`` only consumes ``submodules.activation_func`` when
+        ``config.use_te_activation_func == True`` (otherwise it falls
+        back to the callable in ``config.activation_func``).
+
+        Returning the TE class unconditionally caused a silent
+        contract mismatch in V4 yamls (which keep
+        ``use_te_activation_func: false`` by default — V4 wants the
+        clamped-SwiGLU eager path so the activation-clamp gets
+        applied).
+
+        Behavior:
+
+        * ``config.use_te_activation_func`` is True → return the TE
+          activation class (instantiated by Megatron MLP at build).
+        * Otherwise → return ``None`` so the spec leaves the
+          ``MLPSubmodules.activation_func`` slot empty and Megatron
+          MLP uses ``config.activation_func`` (V4's clamped SwiGLU).
+
+        This keeps the spec self-consistent: if the V4 yaml opts into
+        the TE path, the spec carries the TE class; otherwise the
+        spec carries ``None`` instead of a class that would be
+        silently ignored.
+        """
+        cfg = getattr(self, "config", None)
+        if cfg is not None and bool(getattr(cfg, "use_te_activation_func", False)):
+            return self.activation_func()
+        return None
+
+    def v4_grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: Optional[bool] = None
+    ):
+        """Grouped-MLP module selection for V4 MoE expert path."""
+        return self.grouped_mlp_modules(
+            moe_use_grouped_gemm=moe_use_grouped_gemm,
+            moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        )
+
+    # ---- V4 spec factories (plan-2 P14 §5/§6) -------------------------
+
+    def v4_grouped_mlp_spec(
+        self,
+        *,
+        swiglu_limit: float,
+        moe_use_grouped_gemm: bool = True,
+        moe_use_legacy_grouped_gemm: Optional[bool] = None,
+    ):
+        """Return a ready-to-use ``ModuleSpec`` for V4 grouped MoE experts.
+
+        The V4 pre-multiplication clamp itself is applied through
+        ``config.activation_func_clamp_value`` (Megatron's MLP eager
+        ``glu()`` already clamps gate (max=alpha) and up (+/- alpha)
+        before SiLU + multiply, which is bit-equal to the HF reference
+        ``Expert.forward`` math). This spec only commits to the right
+        grouped module + the column / row-parallel linears; the runtime
+        config carries the clamp value.
+
+        Args:
+            swiglu_limit: V4 ``alpha`` value (the released ``DeepSeek-V4-Flash``
+                checkpoint uses ``7.0``). Recorded on the returned spec
+                so the caller can assert it lines up with the runtime
+                config; not consumed by the grouped-MLP module directly.
+            moe_use_grouped_gemm: prefer the TE / Turbo grouped-gemm
+                module over the local SequentialMLP fallback (default
+                True in production).
+            moe_use_legacy_grouped_gemm: optional override for the
+                legacy code path; when ``None`` the provider reads the
+                Primus arg of the same name.
+
+        Returns:
+            A ``ModuleSpec`` whose ``module`` is the grouped MoE module
+            and whose ``submodules`` carry the linear modules. Caller
+            wires this into :class:`DeepseekV4MoESubmodules.grouped_experts`.
+
+        Notes:
+            * Plan-2 P14 §5 calls for "downgrade to local experts with
+              explicit warning" when the grouped backend cannot apply
+              the clamp; that downgrade lives in
+              :class:`DeepseekV4MoE` (which already builds
+              :class:`ClampedSwiGLUMLP` local experts when
+              ``pg_collection is None`` or the backend declares no
+              clamp support).
+        """
+        del swiglu_limit  # documented but not consumed by the grouped MLP itself
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        module, submodules = self.v4_grouped_mlp_modules(
+            moe_use_grouped_gemm=moe_use_grouped_gemm,
+            moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        )
+        if submodules is None:
+            return ModuleSpec(module=module)
+        return ModuleSpec(module=module, submodules=submodules)
+
+    def v4_router_spec(self, *, learned: bool = True):
+        """Return a ``ModuleSpec`` for the V4 hash / learned router.
+
+        Args:
+            learned: when True (default) returns the learned router
+                spec (``layer_idx >= num_hash_layers``); when False
+                returns the hash-router spec (``layer_idx <
+                num_hash_layers``).
+
+        Returns:
+            A bare-module ``ModuleSpec`` suitable for
+            :class:`DeepseekV4MoESubmodules.{learned_router, hash_router}`.
+            Both routers are ``nn.Module`` standalones (not
+            ``TopKRouter`` subclasses) so they instantiate cleanly on
+            CPU; aux-loss / z-loss / RouterReplay inheritance is
+            tracked as a P19 follow-up.
+        """
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        from primus.backends.megatron.core.transformer.moe.v4_hash_router import (
+            DeepseekV4HashRouter,
+        )
+        from primus.backends.megatron.core.transformer.moe.v4_topk_router import (
+            DeepseekV4LearnedRouter,
+        )
+
+        return ModuleSpec(module=(DeepseekV4LearnedRouter if learned else DeepseekV4HashRouter))
+
+
+class KimiK3SpecProvider(PrimusTurboSpecProvider):
+    """Kimi K3 provider rooted on PrimusTurboSpecProvider.
+
+    Same arrangement as :class:`DeepSeekV4SpecProvider`: the K3 spec
+    helpers take a provider instance rather than reaching for module-level
+    backend classes, so a single audit point decides whether TE or
+    PrimusTurbo wires the K3 modules. Resolve it through
+    ``primus.backends.megatron.core.models.kimi_k3.build_context.resolve_k3_provider``,
+    which caches one instance per config.
+
+    Unlike V4, Kimi K3 needs **no bespoke router**: its gate is
+    DeepSeek-V3's ``noaux_tc``, which upstream ``TopKRouter`` already
+    implements exactly (see the router notes in
+    ``kimi_k3/moe/k3_stable_latent_moe.py``). There is correspondingly no
+    ``k3_router_spec``.
+    """
+
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config
+
+    def k3_norm_module(self) -> type:
+        """Norm module used by K3 specs (block / layer / final / latent MoE).
+
+        Kimi K3 is RMSNorm throughout (``KimiRMSNorm``,
+        ``modeling_kimi_linear.py:226-236``).
+        """
+        return self.layer_norm(rms_norm=True)
+
+    def k3_mlp_activation_func(self) -> Optional[type]:
+        """Activation-func selection for K3 MLP / shared-expert specs.
+
+        Same gating contract as
+        :meth:`DeepSeekV4SpecProvider.v4_mlp_activation_func`:
+        ``MLP.__init__`` only reads ``submodules.activation_func`` when
+        ``config.use_te_activation_func`` is set (``mlp.py:226-229``), and
+        otherwise takes the callable from ``config.activation_func``.
+        Returning a class unconditionally would put a silently-ignored one in
+        the spec.
+
+        What it returns is **not** TE's activation op. Kimi K3's activation is
+        ``situ`` (``modeling_kimi_linear.py:64-82``), a fused GLU activation
+        with two different tanh soft-clamp bounds; TE has no equivalent. The
+        module slot is the only hook that sees the fused ``[..., 2I]`` tensor,
+        which is exactly why the K3 yamls set ``use_te_activation_func: true``
+        — the flag names TE only for historical reasons, and upstream reads it
+        as "use the module slot".
+        """
+        cfg = getattr(self, "config", None)
+        if cfg is None or not bool(getattr(cfg, "use_te_activation_func", False)):
+            return None
+        from primus.backends.megatron.core.transformer.kimi_k3.situ_activation import (
+            SituActivation,
+        )
+
+        return SituActivation
+
+    def k3_grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: Optional[bool] = None
+    ):
+        """Grouped-MLP module selection for the K3 routed-expert path.
+
+        The routed experts run at ``routed_expert_hidden_size``; upstream
+        derives that width from ``config.moe_latent_size`` inside the
+        grouped module itself (``experts.py:185,203-208``), so no
+        width-carrying config clone is needed here.
+
+        The ``activation_func`` slot does have to be filled, though.
+        ``TEGroupedMLP`` reads it under the same
+        ``config.use_te_activation_func`` gate as plain ``MLP``
+        (``experts.py:196-199``) and applies it to the fused post-``fc1``
+        tensor (``:272-275``). Leaving it ``None`` with the flag set would fall
+        back to ``config.activation_func`` — ``F.silu`` — applied to the whole
+        ``[..., 2I]`` tensor, which is both the wrong activation and the wrong
+        width for ``linear_fc2``. The base provider does not fill it, so K3
+        does.
+        """
+        module, submodules = self.grouped_mlp_modules(
+            moe_use_grouped_gemm=moe_use_grouped_gemm,
+            moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        )
+        activation_func = self.k3_mlp_activation_func()
+        if activation_func is not None and submodules is not None:
+            submodules.activation_func = activation_func
+        return module, submodules

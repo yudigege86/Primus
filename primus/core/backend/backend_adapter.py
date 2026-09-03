@@ -1,5 +1,5 @@
 ###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # See LICENSE for license information.
 ###############################################################################
@@ -29,19 +29,58 @@ class BackendAdapter(ABC):
     # Default Methods (May be overridden by subclasses)
     # ============================================================================
 
+    def env_defaults(self) -> list:
+        """
+        Declarative backend environment defaults (opt-in).
+
+        Return a list of :class:`primus.core.backend.env_registry.EnvVar`
+        entries describing the performance/architecture environment this backend
+        needs. The base :meth:`prepare_backend` applies them (arch-gated,
+        ``setdefault`` semantics) before the backend imports its GPU libraries, so
+        a backend never has to touch ``os.environ`` directly.
+
+        Default is an empty list: backends whose env is fully handled by the shell
+        launcher / torchrun (e.g. Megatron, TorchTitan) opt out simply by not
+        overriding this method, and :meth:`apply_env_defaults` becomes a no-op for
+        them (no arch detection, no env mutation).
+
+        Precedence (highest wins): per-config ``env:`` > outer/shell env >
+        these defaults > image-baked.
+        """
+        return []
+
+    def apply_env_defaults(self) -> None:
+        """Apply :meth:`env_defaults` into ``os.environ`` (see ``env_registry``)."""
+        from primus.core.backend.env_registry import apply_env_defaults
+
+        def _safe_log(msg: str) -> None:
+            # Env application must never abort a run on a logging issue (e.g. the
+            # Primus logger not yet initialized in a bare/standalone invocation).
+            try:
+                from primus.core.utils.module_utils import log_rank_0
+
+                log_rank_0(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+        apply_env_defaults(self.env_defaults(), self.framework, _safe_log)
+
     def prepare_backend(self, config: Any):
         """
         Prepare backend environment before building args / constructing trainer.
 
         Default behavior:
+          - Apply this backend's declarative env defaults (:meth:`env_defaults`).
           - Run backend-specific setup hooks registered in `BackendRegistry`.
 
         Backends can override this method if they need extra environment setup
-        beyond `BackendRegistry.run_setup(self.framework)`.
+        beyond the above. Most backends should instead just override
+        :meth:`env_defaults` and keep this default implementation.
         """
         from primus.core.backend.backend_registry import BackendRegistry
-        from primus.modules.module_utils import log_rank_0
+        from primus.core.utils.module_utils import log_rank_0
 
+        self.apply_env_defaults()
         BackendRegistry.run_setup(self.framework)
         log_rank_0(f"[Primus:{self.framework}] Backend prepared")
 
@@ -57,7 +96,7 @@ class BackendAdapter(ABC):
         import sys
         from pathlib import Path
 
-        from primus.modules.module_utils import log_rank_0
+        from primus.core.utils.module_utils import log_rank_0
 
         def _use_path(path: str, error_msg: str) -> str:
             norm_path = os.path.abspath(os.path.normpath(str(path)))
@@ -117,12 +156,18 @@ class BackendAdapter(ABC):
     # ============================================================================
 
     @abstractmethod
-    def load_trainer_class(self, stage: str = "pretrain"):
+    def load_trainer_class(self, stage: str = "pretrain", trainer_class: Optional[str] = None):
         """
         Return backend Trainer class registered in `BackendRegistry`.
 
+        Args:
+            stage: Training stage (e.g., "pretrain", "sft"). Defaults to "pretrain".
+            trainer_class: Optional specific trainer class name for dynamic loading.
+                          If provided, this takes precedence over stage-based selection.
+
         Default behavior:
-          - Lookup trainer via `BackendRegistry.get_trainer_class(self.framework, stage=stage)`
+          - If `trainer_class` is provided, attempt to dynamically load it
+          - Otherwise, lookup trainer via `BackendRegistry.get_trainer_class(self.framework, stage=stage)`
 
         Backends can override this method if they need special resolution rules.
         """

@@ -45,7 +45,7 @@ Docker/Podman Options:
         --cap-add <CAPABILITY>       Add Linux capabilities (e.g., SYS_PTRACE)
 
     Container Configuration:
-        --image <DOCKER_IMAGE>       Docker image [default: rocm/primus:v26.3]
+        --image <DOCKER_IMAGE>       Docker image [default: container.options.image in runner/.primus.yaml]
         --name <NAME>                Container name
         --user <UID:GID>             Run as specific user (e.g., 1000:1000)
         --network <NET>              Network mode (e.g., host, bridge)
@@ -408,6 +408,14 @@ for key in "${!container_config[@]}"; do
     [[ "$opt_name" == "image" ]] && continue
     [[ "$opt_value" == "[]" ]] && continue
 
+    # Make the container name unique per job so an orphaned container left by a
+    # previous/cancelled job on a reused node doesn't cause a "name already in
+    # use" conflict. SLURM_JOB_ID is per-job (same on all its nodes, unique across
+    # jobs); fall back to the PID when not under Slurm.
+    if [[ "$opt_name" == "name" && -n "$opt_value" && "$opt_value" != *$'\n'* ]]; then
+        opt_value="${opt_value}-${SLURM_JOB_ID:-$$}"
+    fi
+
     # Check if this is a cumulative option
     is_cumulative=0
     for cum_opt in "${CUMULATIVE_OPTIONS[@]}"; do
@@ -452,7 +460,10 @@ if [[ "$CLEAN_DOCKER_CONTAINER" == "true" ]]; then
     LOG_INFO_RANK0 "[container] Cleaning up existing containers..."
     CONTAINERS="$($CONTAINER_RUNTIME ps -aq)"
     if [[ -n "$CONTAINERS" ]]; then
-        printf '%s\n' "$CONTAINERS" | xargs -r -n1 "$CONTAINER_RUNTIME" rm -f
+        # Tolerate per-container removal failures ("removal already in progress",
+        # "No such container") so a stale/concurrently-removing container on a
+        # shared node does not abort the whole run via xargs' exit code 123.
+        printf '%s\n' "$CONTAINERS" | xargs -r -n1 -I{} sh -c "$CONTAINER_RUNTIME rm -f {} 2>/dev/null || true"
         LOG_INFO_RANK0 "[container] Removed containers: $CONTAINERS"
     else
         LOG_INFO_RANK0 "[container] No containers to remove."
@@ -528,6 +539,29 @@ LOG_INFO_RANK0 "[container] Would execute: ${CMD[*]}"
 if [[ "$DRY_RUN_MODE" == "true" ]]; then
     LOG_INFO "[container] Dry-run mode: command not executed"
     exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: authenticate to the container registry before the implicit pull.
+# On clusters whose compute nodes are not pre-logged-in, a private image
+# (e.g. docker.io/tasimage/primus:*) cannot be pulled and `docker run` fails
+# with "Unable to find image '<image>' locally" followed by a pull-access
+# error. Export DOCKER_LOGIN_USER and DOCKER_LOGIN_KEY (e.g. a Docker Hub PAT)
+# and the scheduler propagates them to every node (spur sbatch --export=ALL),
+# so the login+pull happens automatically at launch. DOCKER_LOGIN_REGISTRY is
+# optional and defaults to Docker Hub.
+# ---------------------------------------------------------------------------
+if [[ -n "${DOCKER_LOGIN_KEY:-}" ]]; then
+    if [[ -z "${DOCKER_LOGIN_USER:-}" ]]; then
+        LOG_ERROR "[container] DOCKER_LOGIN_KEY is set but DOCKER_LOGIN_USER is empty."
+        exit 1
+    fi
+    LOG_INFO_RANK0 "[container] Logging in to registry ${DOCKER_LOGIN_REGISTRY:-docker.io} as ${DOCKER_LOGIN_USER}..."
+    if ! printf '%s' "${DOCKER_LOGIN_KEY}" | \
+        "$CONTAINER_RUNTIME" login ${DOCKER_LOGIN_REGISTRY:+"$DOCKER_LOGIN_REGISTRY"} -u "${DOCKER_LOGIN_USER}" --password-stdin; then
+        LOG_ERROR "[container] Registry login failed for user ${DOCKER_LOGIN_USER}."
+        exit 1
+    fi
 fi
 
 LOG_INFO "[container] Executing command..."

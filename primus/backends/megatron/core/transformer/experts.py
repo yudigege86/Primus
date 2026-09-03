@@ -5,6 +5,12 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from megatron.core import tensor_parallel
+from megatron.core.activations import squared_relu
+from megatron.core.fusions.fused_bias_geglu import (
+    quick_gelu,
+    weighted_bias_quick_geglu_impl,
+)
+from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -39,7 +45,77 @@ class PrimusGroupedMLP(TEGroupedMLP):
 
         # NOTE: use_turbo_fused_act_with_probs is prioritized over use_te_activation_func and bias_activation_fusion
         self.use_turbo_fused_act_with_probs = args.use_turbo_fused_act_with_probs
-        self.use_turbo_permute_padding = args.use_turbo_permute_padding
+        self.moe_router_padding_for_quantization = args.moe_router_padding_for_quantization
+        self.turbo_grouped_gemm_without_padding = getattr(args, "turbo_grouped_gemm_without_padding", False)
+        # PrimusTurbo grouped GEMMs consume the original GPU tokens_per_expert
+        # tensor for every supported quantization recipe. Keep TE's explicit
+        # zero-padding fallback only when the no-padding path is not enabled.
+
+    def _use_explicit_quantization_padding(self) -> bool:
+        """Whether this forward must pad expert groups before quantization."""
+        if not (self.config.fp8 or self.config.fp4):
+            return False
+        if self.moe_router_padding_for_quantization:
+            return False
+        return not self.turbo_grouped_gemm_without_padding
+
+    def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
+        """
+        Applies bias and activation function to the output of linear_fc1.
+        """
+        if self.config.use_te_activation_func:
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if permuted_probs is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        elif self.config.bias_activation_fusion:
+            if self.activation_func == F.silu and self.config.gated_linear_unit:
+                from primus.backends.megatron.core.fusions.fused_bias_swiglu import (
+                    weighted_bias_swiglu_impl,
+                )
+
+                # dtype is handled inside the fused kernel
+                intermediate_parallel = weighted_bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                    self.config.activation_func_clamp_value,
+                )
+            elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                intermediate_parallel = weighted_bias_quick_geglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    permuted_probs,
+                    self.config.activation_func_fp8_input_store,
+                    self.config.glu_linear_offset,
+                    self.config.activation_func_clamp_value,
+                )
+            else:
+                raise ValueError("Only support fusion of swiglu and quick_gelu in TEGroupedMLP.")
+        elif self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu:
+            assert bias_parallel is None, "Bias is not supported with fused weighted squared relu."
+            intermediate_parallel = weighted_squared_relu_impl(intermediate_parallel, permuted_probs)
+        else:
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                    if (val := self.config.activation_func_clamp_value) is not None:
+                        x_glu = x_glu.clamp(min=None, max=val)
+                        x_linear = x_linear.clamp(min=-val, max=val)
+                    return self.config.activation_func(x_glu) * (x_linear + self.config.glu_linear_offset)
+
+                intermediate_parallel = glu(intermediate_parallel)
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+            original_dtype = intermediate_parallel.dtype
+            intermediate_parallel = intermediate_parallel * permuted_probs
+            intermediate_parallel = intermediate_parallel.to(original_dtype)
+        return intermediate_parallel
 
     def bias_act_func_with_mask(
         self,
@@ -56,6 +132,17 @@ class PrimusGroupedMLP(TEGroupedMLP):
             assert (
                 tokens_per_experts is not None
             ), "tokens_per_experts is required when `use_turbo_fused_act_with_probs` is True."
+
+            # TODO(ruibin)： The turbo kernel takes no clamp / offset / fp8-input-store arguments
+            assert (
+                self.config.activation_func_clamp_value is None
+            ), "`use_turbo_fused_act_with_probs` does not support activation_func_clamp_value."
+            assert (
+                self.config.glu_linear_offset == 0.0
+            ), "`use_turbo_fused_act_with_probs` does not support a non-zero glu_linear_offset."
+            assert (
+                not self.config.activation_func_fp8_input_store
+            ), "`use_turbo_fused_act_with_probs` does not support activation_func_fp8_input_store."
 
             if self.activation_func == F.silu and self.config.gated_linear_unit:
                 activation = "silu"
@@ -77,6 +164,18 @@ class PrimusGroupedMLP(TEGroupedMLP):
             # use the original bias_act_func from TEGroupedMLP, ignore the tokens_per_experts
             return self.bias_act_func(intermediate_parallel, bias_parallel, permuted_probs)
 
+    @staticmethod
+    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
+        if bias_parallel is None:
+            return intermediate_parallel
+
+        # NOTE: tokens_per_expert is on GPU, so we need to convert it to a list of ints.
+        tokens_per_expert_cpu = tokens_per_expert.tolist()
+
+        return super()._apply_bias(
+            intermediate_parallel, bias_parallel, tokens_per_expert_cpu, permuted_probs
+        )
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -94,11 +193,12 @@ class PrimusGroupedMLP(TEGroupedMLP):
         Return:
             output (torch.Tensor): The output of the local experts.
         """
-        if not self.use_turbo_permute_padding and (self.config.fp8 or self.config.fp4):
-            # NOTE: When use_turbo_permute_padding is true the token is padded. So we can skip the padding here to reduce cpu sync.
+        use_explicit_quantization_padding = self._use_explicit_quantization_padding()
+        if use_explicit_quantization_padding:
+            # NOTE: When moe_router_padding_for_quantization is true the token is padded. So we can skip the padding here to reduce cpu sync.
             tokens_per_expert_cpu: list[int] = tokens_per_expert.tolist()
             actual_tokens_per_expert_cpu: list[int] = tokens_per_expert_cpu
-            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+            permuted_local_hidden_states, tokens_per_expert_cpu = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert_cpu
             )
             permuted_probs, _ = self.quantization_padding(
@@ -136,13 +236,19 @@ class PrimusGroupedMLP(TEGroupedMLP):
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                # NOTE: use the bias_act_func_with_mask instead of the bias_act_func to reduce the extra compute when stage of `sync_free_moe` is 3.
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     self.bias_act_func_with_mask, fc1_output, bias_parallel, permuted_probs, tokens_per_expert
                 )
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
-                bias_act_output = self.bias_act_func(fc1_output, bias_parallel, permuted_probs)
+                # Honor use_turbo_fused_act_with_probs independently of activation
+                # recomputation. The helper falls back to bias_act_func when disabled.
+                bias_act_output = self.bias_act_func_with_mask(
+                    fc1_output,
+                    bias_parallel,
+                    permuted_probs,
+                    tokens_per_expert,
+                )
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
@@ -151,11 +257,10 @@ class PrimusGroupedMLP(TEGroupedMLP):
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
             output = off_interface.group_commit(output, name="moe_act", forced_released_tensors=[fc1_output])
-        # NOTE: tokens_per_expert is on GPU, so we need to convert it to a list of ints.
-        output = self._apply_bias(output, output_bias, tokens_per_expert.tolist(), permuted_probs)
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
-        if not self.use_turbo_permute_padding and (self.config.fp8 or self.config.fp4):
+        if use_explicit_quantization_padding:
             output = self.quantization_unpadding(output, actual_tokens_per_expert_cpu)
 
         output_bias = None
